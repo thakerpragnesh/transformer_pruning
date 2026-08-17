@@ -1,4 +1,5 @@
 from .layers import LayerHandle, LayerKind, discover_layers
+from .model_adapter import FFNLayerAdapter, AttentionLayerAdapter, TransformerLayerAdapter, BertLayerAdapter
 from .scoring import SaliencyScorer, Max3SaliencyScorer, lowest_scoring
 from .network_scanner import NetworkSaliencyScanner
 from .head_analysis import AttentionHeadAnalyzer
@@ -12,6 +13,10 @@ __all__ = [
     "LayerHandle",
     "LayerKind",
     "discover_layers",
+    "FFNLayerAdapter",
+    "AttentionLayerAdapter",
+    "TransformerLayerAdapter",
+    "BertLayerAdapter",
     "SaliencyScorer",
     "Max3SaliencyScorer",
     "lowest_scoring",

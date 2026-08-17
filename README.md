@@ -12,8 +12,9 @@ project runs on HuggingFace `transformers`/`datasets` against BERT + GLUE.
 
 ## Architecture
 
-The package is built around two small interfaces so that adding a new
-pruning criterion never means touching scanning or surgery code:
+The package is built around three small interfaces so that adding a new
+pruning criterion, or targeting a new model family, never means touching
+scanning, surgery, or orchestration code:
 
 - **`SaliencyScorer`** (`scoring.py`) — scores a weight tensor's output
   units. `Max3SaliencyScorer` is the only implementation so far (a
@@ -25,8 +26,22 @@ pruning criterion never means touching scanning or surgery code:
   `SaliencyScorer`; `TwinRedundancySelector` instead uses behavioral
   (co-activation) redundancy. Both are interchangeable wherever a
   selector is expected.
+- **`FFNLayerAdapter` / `AttentionLayerAdapter`** (`model_adapter.py`) —
+  reach into a model to get/set a layer's FFN `(intermediate, output)`
+  pair, or to read its attention query weight and head config,
+  respectively. Split in two because no consumer needs both:
+  `prune_ffn_layer` and `ActivationRecorder` depend only on
+  `FFNLayerAdapter`; `AttentionHeadAnalyzer` depends only on
+  `AttentionLayerAdapter` (Interface Segregation). `BertLayerAdapter`
+  implements both (exposed together as `TransformerLayerAdapter`) since
+  BERT has both blocks at the same `encoder.layer[i]` layout, but a
+  future adapter needing only FFN support wouldn't have to stub out
+  attention methods it has no use for. It's the only implementation so
+  far — it also covers RoBERTa, which shares BERT's layout — but a
+  differently-shaped architecture is a new adapter class, not an edit to
+  any of the three consumers.
 
-Everything else is plain, single-purpose modules consuming those two
+Everything else is plain, single-purpose modules consuming those
 interfaces:
 
 - **`layers.py`** — `discover_layers`: finds `Conv2d`/`Linear` modules by
@@ -39,8 +54,9 @@ interfaces:
   physically resize a BERT FFN's `(intermediate, output)` Linear pair,
   given a `keep_indices` list. Written once; every selector shares it.
 - **`pruning_workflow.py`** — `prune_ffn_layer(model, layer_index,
-  selector)`: wires a `NeuronSelector` to `FFNSurgeon`. This is the one
-  place selection and surgery meet.
+  selector)`: wires a `NeuronSelector` to `FFNSurgeon` via a
+  `TransformerLayerAdapter`. This is the one place selection and surgery
+  meet.
 - **`attention_similarity` → `head_analysis.py`** —
   `AttentionHeadAnalyzer`: cosine similarity and Lp-distance between
   attention heads, with a `normalize` flag replacing what used to be two

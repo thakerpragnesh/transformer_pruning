@@ -9,11 +9,14 @@ mechanics don't change if the analysis criterion does, and vice versa.
 """
 import torch
 
+from .model_adapter import BertLayerAdapter
+
 
 class ActivationRecorder:
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, adapter=None):
         self.model = model
         self.tokenizer = tokenizer
+        self.adapter = adapter or BertLayerAdapter(model)
         self.model.eval()
         self._activations = []
         self._hook_handle = None
@@ -23,7 +26,7 @@ class ActivationRecorder:
         self._activations.append(fired.reshape(-1, fired.shape[-1]).detach().cpu())
 
     def record(self, texts, layer_idx: int) -> torch.Tensor:
-        target_module = self.model.encoder.layer[layer_idx].intermediate.dense
+        target_module, _ = self.adapter.get_ffn(layer_idx)
         self._hook_handle = target_module.register_forward_hook(self._hook_fn)
         try:
             for text in texts:
