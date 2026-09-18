@@ -10,6 +10,10 @@ share a research idea, not code: `pruning_framwork_v4` is a config.ini-driven
 framework built around torchvision VGG/ResNet + CIFAR10/IntelIC, while this
 project runs on HuggingFace `transformers`/`datasets` against BERT + GLUE.
 
+New to this codebase? See [`docs/KNOWLEDGE_TRANSFER.md`](docs/KNOWLEDGE_TRANSFER.md)
+for a full developer onboarding doc — architecture rationale, a
+module-by-module reference, extension recipes, and known gotchas.
+
 ## Architecture
 
 The package is built around three small interfaces so that adding a new
