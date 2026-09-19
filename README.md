@@ -16,75 +16,133 @@ module-by-module reference, extension recipes, and known gotchas.
 
 ## Architecture
 
-The package is built around three small interfaces so that adding a new
+The package is built around a few small interfaces so that adding a new
 pruning criterion, or targeting a new model family, never means touching
-scanning, surgery, or orchestration code:
+scanning, surgery, or orchestration code.
+
+### Interfaces
 
 - **`SaliencyScorer`** (`scoring.py`) — scores a weight tensor's output
-  units. `Max3SaliencyScorer` is the only implementation so far (a
-  `torch.topk`-based, GPU-friendly rewrite of `pruning_framwork_v4`'s
-  `compute_max3_saliency_score_channel`), but an SVD- or K-means-based
-  scorer could be added here without changing anything downstream.
-- **`NeuronSelector`** (`selectors.py`) — decides which neuron indices in
-  a BERT FFN layer survive pruning. `SaliencySelector` wraps any
-  `SaliencyScorer`; `TwinRedundancySelector` instead uses behavioral
-  (co-activation) redundancy. Both are interchangeable wherever a
-  selector is expected.
+  units. `TopKMagnitudeScorer(k)` generalizes the thesis's Max-3 rule
+  (`Max3SaliencyScorer` is `k=3`) across conv and linear weights in one
+  code path; `LpNormScorer` is the standard magnitude baseline, kept here
+  so an experiment can report both from the same scanner.
+- **`NeuronSelector`** (`selectors.py`) — decides which FFN neurons
+  survive, given an `FFNContext`. Returns a `Selection`.
 - **`FFNLayerAdapter` / `AttentionLayerAdapter`** (`model_adapter.py`) —
   reach into a model to get/set a layer's FFN `(intermediate, output)`
-  pair, or to read its attention query weight and head config,
-  respectively. Split in two because no consumer needs both:
-  `prune_ffn_layer` and `ActivationRecorder` depend only on
-  `FFNLayerAdapter`; `AttentionHeadAnalyzer` depends only on
-  `AttentionLayerAdapter` (Interface Segregation). `BertLayerAdapter`
-  implements both (exposed together as `TransformerLayerAdapter`) since
-  BERT has both blocks at the same `encoder.layer[i]` layout, but a
-  future adapter needing only FFN support wouldn't have to stub out
-  attention methods it has no use for. It's the only implementation so
-  far — it also covers RoBERTa, which shares BERT's layout — but a
-  differently-shaped architecture is a new adapter class, not an edit to
-  any of the three consumers.
+  pair, or to read its attention query weight and head config. Split in
+  two because no consumer needs both (Interface Segregation).
+  `BertLayerAdapter` implements both — it also covers RoBERTa, which
+  shares BERT's layout — but a differently-shaped architecture is a new
+  adapter class, not an edit to any consumer.
 
-Everything else is plain, single-purpose modules consuming those
-interfaces:
+### What a selector gets to see
+
+A selector receives an **`FFNContext`** (`context.py`), not a bare weight
+tensor. That matters because a neuron's actual contribution to the layer
+output is
+
+```
+W_out[:, i] * act(W_in[i] @ x + b_i)
+```
+
+so a criterion that sees only `W_in` is reasoning about half the neuron.
+The context carries both projections, both biases, and — when the caller
+has calibrated — per-neuron activation statistics.
+
+A selector returns a **`Selection`**: the indices to keep, plus an
+optional `merge_map`. The map is what lets a redundancy criterion do
+something better than deleting its loser: if neuron `j` was flagged
+*because* it behaves like neuron `i`, then `W_out[:, j] * a_j` is not
+noise to discard, it is signal `W_out[:, i] * a_i` can carry.
+
+### The criteria
+
+| Selector | Sees | Idea |
+|---|---|---|
+| `SaliencySelector` | `W_in` | Any `SaliencyScorer` — the thesis's Max-3 rule, or an Lp norm |
+| `InOutNormSelector` | `W_in`, `W_out` | `‖W_in[i]‖ · ‖W_out[:,i]‖` — a neuron nothing reads is worthless however hard it's driven |
+| `ActivationAwareSelector` | `W_out`, activations | `‖W_out[:,i]‖ · E[\|a_i\|]` — measures *use*, not just capacity |
+| `TwinRedundancySelector` | firing patterns | Behavioural redundancy; can merge rather than drop |
+
+Weight-only criteria measure how strongly a neuron is *wired*. They
+cannot see that a well-wired neuron may almost never fire on the target
+distribution — common in a fine-tuned model, where the pretrained FFN
+carries capacity the downstream task never exercises. That is what
+calibration supplies.
+
+### Making a cut cost less
+
+Two corrections apply to any criterion, both in `FFNSurgeon`:
+
+- **Bias compensation.** Deleting neuron `i` removes `W_out[:, i] * a_i`
+  from the layer output. Its expectation `W_out[:, i] * E[a_i]` is a
+  constant, and a constant is exactly what a bias represents exactly — so
+  folding it into `output.bias` preserves the layer's mean output for
+  free, leaving only the zero-mean residual as real damage. Costs one
+  calibration pass.
+- **Merging.** Fold a removed neuron's output column into a surviving one.
+  When the two are genuinely interchangeable this is output-preserving on
+  *every* input, not merely on average.
+
+### Everything else
 
 - **`layers.py`** — `discover_layers`: finds `Conv2d`/`Linear` modules by
   type and name, nothing else.
 - **`network_scanner.py`** — `NetworkSaliencyScanner(layers, scorer)`:
-  reports per-layer saliency stats and weakest units for *any* layer set
-  + scorer combination — this one class covers what used to be two
-  near-duplicate classes (a VGG-only scanner and a VGG+BERT scanner).
+  per-layer saliency stats and weakest units for *any* layer set + scorer
+  combination.
 - **`ffn_surgery.py`** — `FFNSurgeon`: the only code that knows how to
-  physically resize a BERT FFN's `(intermediate, output)` Linear pair,
-  given a `keep_indices` list. Written once; every selector shares it.
-- **`pruning_workflow.py`** — `prune_ffn_layer(model, layer_index,
-  selector)`: wires a `NeuronSelector` to `FFNSurgeon` via a
-  `TransformerLayerAdapter`. This is the one place selection and surgery
-  meet.
-- **`attention_similarity` → `head_analysis.py`** —
-  `AttentionHeadAnalyzer`: cosine similarity and Lp-distance between
-  attention heads, with a `normalize` flag replacing what used to be two
-  copy-pasted classes (raw vs. unit-normalized distance).
-- **`activation_recording.py`** — `ActivationRecorder`: hooks a layer and
-  records which neurons fire on real inputs. Pure data collection.
-- **`redundancy.py`** — `JaccardTwinFinder`: pure analysis over a
-  recorded firing tensor, flags neuron pairs with near-identical firing
-  patterns (true Jaccard/IoU) as redundant "twins" — a criterion not in
-  the thesis, exploring whether *behavior* catches redundancy that
-  weight-based scoring misses.
+  physically resize an FFN's `(intermediate, output)` Linear pair.
+  Written once; every selector shares it.
+- **`pruning_workflow.py`** — `prune_ffn_layer` (one layer) and
+  `prune_model_ffn` (the whole stack). The one place selection and
+  surgery meet.
+- **`head_analysis.py`** — `AttentionHeadAnalyzer`: cosine similarity and
+  Lp-distance between attention heads, with a `normalize` flag.
+- **`calibration.py`** — `FFNCalibrator`: streams batches and accumulates
+  per-neuron activation moments without materialising the full
+  `(tokens, neurons)` tensor.
+- **`activation_recording.py`** — `ActivationRecorder`: records which
+  neurons fire on real inputs, keeping full per-token detail (which
+  `JaccardTwinFinder` needs and no summary statistic preserves).
+- **`redundancy.py`** — `JaccardTwinFinder`: flags neuron pairs with
+  near-identical firing patterns (true Jaccard/IoU) as redundant "twins",
+  and reports neurons that never fire at all.
 
-Example: the two full pruning experiments differ only in which selector
-they hand to the same `prune_ffn_layer`/`FFNSurgeon`:
+## Usage
 
 ```python
-# Max-3 saliency pruning
-selector = SaliencySelector(Max3SaliencyScorer(), prune_percent=40)
-prune_ffn_layer(model.bert, layer_index=0, selector=selector)
+from pruning_transformer import (
+    ActivationAwareSelector, FFNCalibrator, Max3SaliencyScorer,
+    SaliencySelector, prune_ffn_layer, prune_model_ffn,
+)
 
-# Co-activation twin pruning
-twins, _ = JaccardTwinFinder().find(recorded_fires, threshold=0.95)
-prune_ffn_layer(model.bert, layer_index=0, selector=TwinRedundancySelector(twins))
+# The thesis criterion, unchanged.
+prune_ffn_layer(model.bert, 0, SaliencySelector(Max3SaliencyScorer(), prune_percent=40))
+
+# Calibrated, with the mean output restored after the cut.
+stats = FFNCalibrator(model.bert).collect(batches, layer_idx=0)
+prune_ffn_layer(
+    model.bert, 0, ActivationAwareSelector(prune_percent=40),
+    stats=stats, compensate_bias=True,
+)
+
+# Whole stack, with every neuron ranked against every other rather than
+# each layer losing the same fixed fraction.
+kept = prune_model_ffn(
+    model.bert, ActivationAwareSelector(prune_percent=40),
+    allocation="global", stats_by_layer=stats_by_layer, compensate_bias=True,
+)  # -> {0: 1900, 1: 1640, 2: 2100, ...}
 ```
+
+Uniform allocation gives every layer the same fraction; global lets
+layers that turn out to be redundant give up more. FFN redundancy is
+generally not spread evenly across depth, so uniform over-cuts the layers
+carrying the model and under-cuts the ones that aren't.
+
+## Experiments
 
 `experiments/` — runnable scripts, one per exploration stage:
 
@@ -94,40 +152,58 @@ prune_ffn_layer(model.bert, layer_index=0, selector=TwinRedundancySelector(twins
 | `02_vgg_network_scan.py` | Max-3 stats across all of VGG16 |
 | `03_bert_universal_scan.py` | Max-3 crossed over onto BERT-tiny FFN |
 | `04_bert_pruning_surgery_demo.py` | Neuron surgery doesn't break a forward pass |
-| `05_bert_mrpc_full_experiment.py` | Real accuracy: baseline → prune → heal, on MRPC |
+| `05_bert_mrpc_full_experiment.py` | Real accuracy: four criteria compared, baseline → prune → heal, on MRPC |
 | `06_attention_head_similarity.py` | Cosine similarity between attention heads |
 | `07_attention_head_distance.py` | Manhattan vs. Euclidean head distance |
 | `08_attention_scaled_distribution.py` | Distance on unit-normalized heads |
-| `09_coactivation_twin_scan.py` | Behavior-based twin-neuron detection |
-| `10_twin_neuron_pruning_experiment.py` | Real accuracy: prune twins → heal, on MRPC |
+| `09_coactivation_twin_scan.py` | Behavior-based twin-neuron and dead-neuron detection |
+| `10_twin_neuron_pruning_experiment.py` | Real accuracy: twins dropped vs. twins merged, on MRPC |
+| `11_global_multilayer_pruning.py` | Uniform vs. global budget allocation at equal compression |
+
+Stages 05, 10 and 11 train. Each compares its variants from one shared
+trained baseline at one fixed seed (`experiments/_mrpc.py`), so the only
+difference between rows is the criterion under test. The interesting
+column is *pre-heal* accuracy — healing can paper over a bad cut given
+enough epochs, so the pre-heal number is what measures how much the
+criterion actually knew.
 
 ## Running
 
 No GPU/PyTorch on the primary dev machine for this project (same
-constraint as `pruning_framwork_v4`) — these scripts are meant to run on
-Colab/Kaggle. Install with:
+constraint as `pruning_framwork_v4`) — the experiment scripts are meant
+to run on Colab/Kaggle:
 
 ```
 pip install -r requirements.txt
-```
-
-Then run any script under `experiments/` directly, e.g.:
-
-```
 python experiments/05_bert_mrpc_full_experiment.py
+```
+
+### Tests
+
+The test suite needs neither a GPU nor HuggingFace — the adapters only
+need a module tree with BERT's `encoder.layer[i]` *shape*, which
+`tests/conftest.py` builds by hand. It runs in well under a second:
+
+```
+pip install -e ".[dev]"
+pytest
 ```
 
 ## Status
 
-All modules are freshly extracted/cleaned from an exploratory Colab
-notebook and have not yet been run end-to-end in this repo's layout —
-treat results as needing a real run before citing, same caveat as
-`pruning_framwork_v4`'s unvalidated numbers.
+The pruning mechanics are covered by the test suite — surgery preserves
+dtype and `requires_grad`, merging identical neurons is exactly
+output-preserving, bias compensation exactly preserves the mean output,
+budgets are honoured, and dead-neuron detection works.
 
-One correctness fix made during extraction: the notebook's `find_twins`
-computed `intersection / (fires_A + fires_B)`, which is off by a factor
-vs. true Jaccard/IoU (`intersection / union`, where
-`union = fires_A + fires_B - intersection`). This repo's
-`co_activation.py` uses the corrected formula, so twin-pair counts/overlap
-percentages will differ slightly from the original notebook's printed
-output.
+The **research numbers are not**. No experiment has been run end-to-end
+in this repo's layout yet; before citing any accuracy figure, actually
+run the corresponding script. Same caveat as `pruning_framwork_v4`'s
+unvalidated numbers.
+
+One correctness fix carried over from the original extraction: the
+notebook's `find_twins` computed `intersection / (fires_A + fires_B)`,
+which is off by a factor vs. true Jaccard/IoU (`intersection / union`,
+where `union = fires_A + fires_B - intersection`). `redundancy.py` uses
+the corrected formula, so twin-pair counts will differ slightly from the
+original notebook's printed output.

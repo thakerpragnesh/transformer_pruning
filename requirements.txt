@@ -1,11 +1,19 @@
-torch
-torchvision
-transformers
-datasets
-evaluate
-accelerate
-scikit-learn
-pandas
-numpy
-seaborn
-matplotlib
+# Core package (pruning_transformer/) -- this is all the library needs.
+torch>=2.0
+numpy>=1.24
+pandas>=2.0
+
+# Running experiments/ additionally needs HuggingFace + plotting.
+# `eval_strategy` was renamed from `evaluation_strategy` in transformers
+# 4.46; the experiment scripts use the new name.
+transformers>=4.46
+datasets>=2.19
+evaluate>=0.4
+accelerate>=0.30
+scikit-learn>=1.3
+torchvision>=0.15
+matplotlib>=3.7
+seaborn>=0.13
+
+# Tests
+pytest>=8.0

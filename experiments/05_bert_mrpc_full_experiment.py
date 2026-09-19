@@ -1,85 +1,92 @@
-"""Stage 5: the full accuracy experiment -- fine-tune BERT-tiny on MRPC,
-prune 40% of layer 0's FFN neurons with Max-3 saliency, measure the
+"""Stage 5: the full accuracy experiment on MRPC.
+
+Fine-tune BERT-tiny, prune 40% of layer 0's FFN neurons, measure the
 accuracy drop, then fine-tune again ("heal") and measure recovery.
+
+Rather than reporting that arc for a single criterion, this runs the same
+arc for four, from the same trained baseline and the same seed, so the
+numbers are directly comparable:
+
+  1. Max-3 saliency                  -- the thesis criterion, as-is
+  2. Max-3 + bias compensation       -- same cut, mean output restored
+  3. In/out norm + compensation      -- also weighs the output projection
+  4. Activation-aware + compensation -- also weighs how hard neurons fire
+
+The interesting column is *pruned* accuracy, before healing. Healing can
+paper over a bad cut given enough epochs; the pre-heal number is what
+actually measures how much the criterion knew.
 """
-import numpy as np
-import evaluate
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    BertForSequenceClassification,
-    DataCollatorWithPadding,
-    Trainer,
-    TrainingArguments,
+import copy
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _mrpc import MrpcHarness, accuracy, report
+
+from pruning_transformer import (
+    ActivationAwareSelector,
+    FFNCalibrator,
+    InOutNormSelector,
+    Max3SaliencyScorer,
+    SaliencySelector,
+    prune_ffn_layer,
 )
 
-from pruning_transformer import Max3SaliencyScorer, SaliencySelector, prune_ffn_layer
-
-MODEL_NAME = "prajjwal1/bert-tiny"
+LAYER = 0
+PRUNE_PERCENT = 40
 
 
 def main():
-    print("Loading MRPC dataset (paraphrase detection)...")
-    dataset = load_dataset("glue", "mrpc")
-    metric = evaluate.load("glue", "mrpc")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    harness = MrpcHarness(num_epochs=3)
 
-    def preprocess(examples):
-        return tokenizer(examples["sentence1"], examples["sentence2"], truncation=True)
-
-    tokenized_datasets = dataset.map(preprocess, batched=True)
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-
-    def compute_metrics(eval_preds):
-        logits, labels = eval_preds
-        predictions = np.argmax(logits, axis=-1)
-        return metric.compute(predictions=predictions, references=labels)
-
-    print("\n--- Phase 1: Training Baseline Model ---")
-    model = BertForSequenceClassification.from_pretrained(MODEL_NAME)
-
-    training_args = TrainingArguments(
-        output_dir="./results",
-        learning_rate=2e-5,
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
-        num_train_epochs=3,
-        weight_decay=0.01,
-        eval_strategy="epoch",
-        save_strategy="no",
-    )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["validation"],
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-
+    print("--- Phase 1: training the shared baseline ---")
+    model = harness.new_model()
+    trainer = harness.new_trainer(model)
     trainer.train()
-    baseline_result = trainer.evaluate()
-    print(f"Baseline Accuracy: {baseline_result['eval_accuracy']:.4f}")
+    baseline = trainer.evaluate()
+    baseline_state = copy.deepcopy(model.state_dict())
+    print(f"Baseline accuracy: {accuracy(baseline):.4f}")
 
-    print("\n--- Phase 2: Applying Max-3 Pruning ---")
-    selector = SaliencySelector(Max3SaliencyScorer(), prune_percent=40)
-    prune_ffn_layer(model.bert, layer_index=0, selector=selector)
+    print("\n--- Phase 2: calibrating layer 0 activations ---")
+    stats = FFNCalibrator(model.bert).collect(harness.calibration_batches(), layer_idx=LAYER)
+    print(f"Calibrated on {stats.tokens} tokens across {stats.num_neurons} neurons.")
 
-    print("\n--- Phase 3: Measuring Damage ---")
-    damage_result = trainer.evaluate()
-    print(f"Post-Pruning Accuracy: {damage_result['eval_accuracy']:.4f}")
-    drop = baseline_result["eval_accuracy"] - damage_result["eval_accuracy"]
-    print(f"Accuracy Drop: {drop:.4f}")
+    variants = [
+        ("Max-3 saliency", SaliencySelector(Max3SaliencyScorer(), PRUNE_PERCENT), False),
+        ("Max-3 + bias comp.", SaliencySelector(Max3SaliencyScorer(), PRUNE_PERCENT), True),
+        ("In/out norm + comp.", InOutNormSelector(PRUNE_PERCENT), True),
+        ("Activation-aware + comp.", ActivationAwareSelector(PRUNE_PERCENT), True),
+    ]
 
-    print("\n--- Phase 4: Healing (Fine-Tuning) ---")
-    trainer.train()
-    healed_result = trainer.evaluate()
+    rows = [("Baseline (unpruned)", f"{accuracy(baseline):.2%}")]
+    for label, selector, compensate in variants:
+        print(f"\n--- {label} ---")
+        # Every variant starts from the identical trained baseline, so the
+        # only difference between runs is the criterion under test.
+        variant_model = harness.new_model()
+        variant_model.load_state_dict(baseline_state)
 
-    print("\n=== FINAL RESULTS ===")
-    print(f"1. Original Accuracy: {baseline_result['eval_accuracy']:.2%}")
-    print(f"2. Pruned Accuracy:   {damage_result['eval_accuracy']:.2%}")
-    print(f"3. Healed Accuracy:   {healed_result['eval_accuracy']:.2%}")
-    print("4. Compression:       Layer 0 FFN reduced by 40%")
+        kept = prune_ffn_layer(
+            variant_model.bert, LAYER, selector, stats=stats, compensate_bias=compensate
+        )
+        print(f"Kept {kept} neurons.")
+
+        # A fresh Trainer: the old one's optimizer still holds the
+        # pre-surgery parameters. See MrpcHarness.new_trainer.
+        variant_trainer = harness.new_trainer(variant_model)
+        pruned = variant_trainer.evaluate()
+        variant_trainer.train()
+        healed = variant_trainer.evaluate()
+
+        rows.append((
+            label,
+            f"pruned {accuracy(pruned):.2%}  ->  healed {accuracy(healed):.2%}"
+            f"   (drop {accuracy(baseline) - accuracy(pruned):+.2%})",
+        ))
+
+    report(rows)
+    print(f"\nCompression: layer {LAYER} FFN reduced by {PRUNE_PERCENT}%.")
 
 
 if __name__ == "__main__":

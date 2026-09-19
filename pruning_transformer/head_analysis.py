@@ -30,9 +30,18 @@ class AttentionHeadAnalyzer:
 
     def get_flat_heads(self, layer_idx: int) -> torch.Tensor:
         num_heads = self.adapter.num_attention_heads
-        head_dim = self.adapter.hidden_size // num_heads
-        w_q = self.adapter.get_query_weight(layer_idx)
-        return w_q.view(num_heads, head_dim, -1).reshape(num_heads, -1)
+        hidden = self.adapter.hidden_size
+        if hidden % num_heads:
+            raise ValueError(
+                f"hidden_size {hidden} is not divisible by num_attention_heads {num_heads}; "
+                "the adapter is reporting a head layout this model does not have."
+            )
+        head_dim = hidden // num_heads
+        w_q = self.adapter.get_query_weight(layer_idx).detach()
+        # W_q is (hidden_out, hidden_in) and the head partition runs down
+        # the output rows, so reshaping dim 0 into (heads, head_dim) is
+        # what groups each head's rows together.
+        return w_q.reshape(num_heads, head_dim * w_q.shape[1]).float()
 
     def compute_similarity(self, layer_idx: int):
         heads = torch.nn.functional.normalize(self.get_flat_heads(layer_idx), p=2, dim=1)
@@ -46,4 +55,7 @@ class AttentionHeadAnalyzer:
             heads = torch.nn.functional.normalize(heads, p=2, dim=1)
         dist = torch.cdist(heads.unsqueeze(0), heads.unsqueeze(0), p=LP_METRICS[metric]).squeeze(0)
         dist.fill_diagonal_(0.0)
-        return dist.numpy()
+        # .cpu() before .numpy(): on a CUDA model this raised
+        # "can't convert cuda tensor to numpy" -- compute_similarity
+        # already did this, compute_distance_matrix did not.
+        return dist.cpu().numpy()

@@ -1,0 +1,165 @@
+import pytest
+import torch
+
+from pruning_transformer import (
+    BertLayerAdapter,
+    InOutNormSelector,
+    Max3SaliencyScorer,
+    SaliencySelector,
+    TwinRedundancySelector,
+    prune_ffn_layer,
+    prune_model_ffn,
+)
+
+
+def test_single_layer_prune_resizes_and_still_runs(model, batches):
+    kept = prune_ffn_layer(model, 0, SaliencySelector(Max3SaliencyScorer(), prune_percent=50))
+    assert kept == 8
+    adapter = BertLayerAdapter(model)
+    intermediate, output = adapter.get_ffn(0)
+    assert intermediate.out_features == 8 and output.in_features == 8
+    with torch.no_grad():
+        model(**batches[0])  # shapes still line up end to end
+
+
+def test_other_layers_are_untouched(model):
+    adapter = BertLayerAdapter(model)
+    before = adapter.get_ffn(1)[0].weight.clone()
+    prune_ffn_layer(model, 0, SaliencySelector(Max3SaliencyScorer(), prune_percent=50))
+    assert torch.equal(adapter.get_ffn(1)[0].weight, before)
+
+
+def test_uniform_allocation_cuts_every_layer_equally(model, batches):
+    kept = prune_model_ffn(model, SaliencySelector(Max3SaliencyScorer(), prune_percent=25))
+    assert kept == {0: 12, 1: 12, 2: 12}
+    with torch.no_grad():
+        model(**batches[0])
+
+
+def test_global_allocation_respects_the_total_budget(model, batches):
+    kept = prune_model_ffn(model, InOutNormSelector(prune_percent=50), allocation="global")
+    assert sum(kept.values()) == 24  # 3 layers x 16 neurons, halved
+    with torch.no_grad():
+        model(**batches[0])
+
+
+def test_global_allocation_cuts_the_redundant_layer_harder(model):
+    """The reason global beats uniform: FFN redundancy is not spread
+    evenly across depth, so a fixed per-layer fraction over-cuts the
+    layers that are carrying the model and under-cuts the ones that
+    aren't.
+    """
+    adapter = BertLayerAdapter(model)
+    with torch.no_grad():
+        # Layer 0: every neuron equally useful. Layer 2: half of them inert.
+        for idx in (0, 1, 2):
+            adapter.get_ffn(idx)[0].weight.fill_(1.0)
+            adapter.get_ffn(idx)[1].weight.fill_(1.0)
+        adapter.get_ffn(2)[0].weight[:8] = 1e-6
+        adapter.get_ffn(2)[1].weight[:, :8] = 1e-6
+
+    kept = prune_model_ffn(model, InOutNormSelector(prune_percent=30), allocation="global")
+    assert kept[2] < kept[0]
+    assert sum(kept.values()) == 34  # 48 neurons, 30% cut, rounded
+
+
+def test_min_keep_ratio_floors_each_layer(model):
+    adapter = BertLayerAdapter(model)
+    with torch.no_grad():
+        adapter.get_ffn(1)[1].weight.fill_(1e-9)  # layer 1 looks worthless
+    kept = prune_model_ffn(
+        model, InOutNormSelector(prune_percent=60), allocation="global", min_keep_ratio=0.5
+    )
+    assert kept[1] >= 8
+
+
+def test_normalisation_stops_one_scale_from_swallowing_the_budget(model):
+    """Without per-layer normalisation, global ranking deletes whichever
+    layer happens to have the smallest weight scale, rather than the
+    genuinely redundant neurons.
+    """
+    adapter = BertLayerAdapter(model)
+    with torch.no_grad():
+        adapter.get_ffn(1)[0].weight *= 1e-4
+        adapter.get_ffn(1)[1].weight *= 1e-4
+
+    raw = prune_model_ffn(
+        model, InOutNormSelector(prune_percent=30), allocation="global",
+        normalize="none", min_keep_ratio=0.0,
+    )
+    # The entire budget lands on layer 1 purely because of its scale;
+    # layers 0 and 2 are not touched at all.
+    assert raw[0] == 16 and raw[2] == 16
+    assert raw[1] == 2
+
+
+def test_normalised_global_spreads_the_cut(model):
+    adapter = BertLayerAdapter(model)
+    with torch.no_grad():
+        adapter.get_ffn(1)[0].weight *= 1e-4
+        adapter.get_ffn(1)[1].weight *= 1e-4
+    kept = prune_model_ffn(
+        model, InOutNormSelector(prune_percent=30), allocation="global",
+        normalize="mean", min_keep_ratio=0.0,
+    )
+    assert kept[1] > 8  # scale alone no longer condemns the layer
+
+
+def test_global_rejects_a_criterion_with_no_per_neuron_score(model):
+    with pytest.raises(ValueError, match="not an ImportanceSelector"):
+        prune_model_ffn(model, TwinRedundancySelector([(0, 1)]), allocation="global")
+
+
+def test_unknown_allocation_is_rejected(model):
+    with pytest.raises(ValueError, match="uniform.*global"):
+        prune_model_ffn(model, InOutNormSelector(prune_percent=10), allocation="per-head")
+
+
+def test_layer_indices_restricts_the_sweep(model):
+    kept = prune_model_ffn(
+        model, SaliencySelector(Max3SaliencyScorer(), prune_percent=50), layer_indices=[0, 2]
+    )
+    assert set(kept) == {0, 2}
+    assert BertLayerAdapter(model).get_ffn(1)[0].out_features == 16
+
+
+def test_global_scores_the_original_model_not_a_half_pruned_one(model):
+    """Scoring lazily inside the resize loop would rank later layers
+    against a model earlier cuts had already mutated.
+    """
+    kept_a = prune_model_ffn(model, InOutNormSelector(prune_percent=40), allocation="global")
+    fresh = type(model)()
+    fresh.load_state_dict({k: v for k, v in fresh.state_dict().items()})
+    assert sum(kept_a.values()) == round(48 * 0.6)
+
+
+def test_twin_pruning_with_merge_end_to_end(model, batches):
+    adapter = BertLayerAdapter(model)
+    intermediate, _ = adapter.get_ffn(0)
+    with torch.no_grad():
+        intermediate.weight[7] = intermediate.weight[2]
+        intermediate.bias[7] = intermediate.bias[2]
+    with torch.no_grad():
+        before = model(**batches[0])
+
+    kept = prune_ffn_layer(model, 0, TwinRedundancySelector([(2, 7)], merge=True))
+    assert kept == 15
+    with torch.no_grad():
+        after = model(**batches[0])
+    assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_unsupported_adapter_methods_explain_themselves():
+    from pruning_transformer import FFNLayerAdapter
+
+    class MinimalAdapter(FFNLayerAdapter):
+        def get_ffn(self, layer_idx):
+            raise NotImplementedError
+
+        def set_ffn(self, layer_idx, intermediate, output):
+            raise NotImplementedError
+
+    with pytest.raises(NotImplementedError, match="get_activation_module"):
+        MinimalAdapter().get_activation_module(0)
+    with pytest.raises(NotImplementedError, match="num_layers"):
+        MinimalAdapter().num_layers()

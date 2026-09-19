@@ -1,87 +1,82 @@
-"""Stage 10: the co-activation counterpart to stage 5's Max-3 experiment
--- fine-tune on MRPC, find co-activation "twin" neurons, drop one of each
-pair, measure the accuracy drop, then heal with further fine-tuning.
+"""Stage 10: the co-activation counterpart to stage 5.
+
+Fine-tune on MRPC, find co-activation "twin" neurons, remove one of each
+pair, measure the drop, then heal.
+
+The comparison here is drop-vs-merge. Both remove exactly the same
+neurons, so compression is identical; the only difference is whether the
+removed twin's output column is folded into its survivor or thrown away.
+If the twins are genuinely twins, merging should cost noticeably less
+accuracy for free -- and if it doesn't, that is itself evidence the
+Jaccard threshold is admitting pairs that aren't really interchangeable.
 """
-import numpy as np
-import evaluate
-from datasets import load_dataset
-from transformers import (
-    AutoTokenizer,
-    BertForSequenceClassification,
-    DataCollatorWithPadding,
-    Trainer,
-    TrainingArguments,
+import copy
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from _mrpc import MrpcHarness, accuracy, report
+
+from pruning_transformer import (
+    ActivationRecorder,
+    FFNCalibrator,
+    JaccardTwinFinder,
+    TwinRedundancySelector,
+    prune_ffn_layer,
 )
 
-from pruning_transformer import ActivationRecorder, JaccardTwinFinder, TwinRedundancySelector, prune_ffn_layer
-
-MODEL_NAME = "prajjwal1/bert-tiny"
+LAYER = 0
+THRESHOLD = 0.95
 
 
 def main():
-    print("Re-initializing model and evaluation environment...")
-    model = BertForSequenceClassification.from_pretrained(MODEL_NAME)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    dataset = load_dataset("glue", "mrpc")
+    harness = MrpcHarness(num_epochs=5)
 
-    def preprocess(examples):
-        return tokenizer(examples["sentence1"], examples["sentence2"], truncation=True)
-
-    tokenized_datasets = dataset.map(preprocess, batched=True)
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    metric = evaluate.load("glue", "mrpc")
-
-    def compute_metrics(eval_preds):
-        logits, labels = eval_preds
-        predictions = np.argmax(logits, axis=-1)
-        return metric.compute(predictions=predictions, references=labels)
-
-    training_args = TrainingArguments(
-        output_dir="./results",
-        learning_rate=2e-5,
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
-        num_train_epochs=5,
-        weight_decay=0.01,
-        eval_strategy="epoch",
-        save_strategy="no",
-    )
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_datasets["train"],
-        eval_dataset=tokenized_datasets["validation"],
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-    )
-
-    print("\n--- Stage 1: Fine-Tuning Baseline ---")
+    print("--- Phase 1: training the shared baseline ---")
+    model = harness.new_model()
+    trainer = harness.new_trainer(model)
     trainer.train()
-    baseline_result = trainer.evaluate()
-    print(f"Pre-Surgery Accuracy: {baseline_result['eval_accuracy']:.4f}")
+    baseline = trainer.evaluate()
+    baseline_state = copy.deepcopy(model.state_dict())
+    print(f"Pre-surgery accuracy: {accuracy(baseline):.4f}")
 
-    print("\n--- Stage 2: Scanning for Co-Activation Twins ---")
-    recorder = ActivationRecorder(model=model.bert, tokenizer=tokenizer)
-    texts = dataset["train"]["sentence1"][:500]
-    recorded_fires = recorder.record(texts, layer_idx=0)
-    twins, _dead = JaccardTwinFinder().find(recorded_fires, threshold=0.95)
-    print(f"Found {len(twins)} twin pairs.")
+    print("\n--- Phase 2: scanning for co-activation twins ---")
+    batches = harness.calibration_batches()
+    fires = ActivationRecorder(model.bert, harness.tokenizer).record_batches(batches, layer_idx=LAYER)
+    twins, dead = JaccardTwinFinder().find(fires, threshold=THRESHOLD)
+    print(f"Recorded {fires.shape[0]} tokens x {fires.shape[1]} neurons.")
+    print(f"Found {len(twins)} twin pairs and {len(dead)} dead neurons.")
+    if not twins:
+        print("No twins at this threshold -- nothing to prune. Try lowering THRESHOLD.")
+        return
 
-    print("\n--- Stage 3: Twin Surgery ---")
-    prune_ffn_layer(model.bert, layer_index=0, selector=TwinRedundancySelector(twins))
+    stats = FFNCalibrator(model.bert).collect(batches, layer_idx=LAYER)
 
-    print("\n--- Measuring 'Twin' Brain Damage ---")
-    twin_damage_result = trainer.evaluate()
-    print(f"Accuracy after dropping twins: {twin_damage_result['eval_accuracy']:.4f}")
+    rows = [("Baseline (unpruned)", f"{accuracy(baseline):.2%}")]
+    for label, merge in [("Twins dropped", False), ("Twins merged", True)]:
+        print(f"\n--- {label} ---")
+        variant_model = harness.new_model()
+        variant_model.load_state_dict(baseline_state)
 
-    print("\n--- Final Healing (Fine-Tuning) ---")
-    trainer.train()
-    final_healed_result = trainer.evaluate()
+        kept = prune_ffn_layer(
+            variant_model.bert, LAYER,
+            TwinRedundancySelector(twins, merge=merge),
+            stats=stats, compensate_bias=True,
+        )
+        print(f"Kept {kept} neurons.")
 
-    print("\n=== RESULTS: TWIN-NEURON PRUNING ===")
-    print(f"1. Pre-Surgery Accuracy:  {baseline_result['eval_accuracy']:.2%}")
-    print(f"2. Post-Twin Accuracy:    {twin_damage_result['eval_accuracy']:.2%}")
-    print(f"3. Final Healed Accuracy: {final_healed_result['eval_accuracy']:.2%}")
+        variant_trainer = harness.new_trainer(variant_model)
+        pruned = variant_trainer.evaluate()
+        variant_trainer.train()
+        healed = variant_trainer.evaluate()
+        rows.append((
+            label,
+            f"pruned {accuracy(pruned):.2%}  ->  healed {accuracy(healed):.2%}"
+            f"   (drop {accuracy(baseline) - accuracy(pruned):+.2%})",
+        ))
+
+    report(rows)
 
 
 if __name__ == "__main__":
