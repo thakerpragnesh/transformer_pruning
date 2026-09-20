@@ -171,10 +171,12 @@ class TwinRedundancySelector(NeuronSelector):
     survivor rather than discarded, which is the point of calling them
     twins: if `a_j ~ a_i`, then `W_out[:, j] * a_j ~ W_out[:, j] * a_i`,
     so adding `W_out[:, j]` onto `W_out[:, i]` reproduces the removed
-    contribution instead of silently deleting it. The scale comes from
-    calibration when available (`E[a_j] / E[a_i]`) and falls back to 1.0
-    otherwise -- 1.0 is exactly right when the twins fire at equal
-    strength, which is the regime a high Jaccard threshold selects for.
+    contribution instead of silently deleting it. The scale is the
+    least-squares-optimal `E[a_j * a_i] / E[a_i^2]` when `ctx.cross_moments`
+    has the pair (see `_merge_scale`), the mean-matching `E[a_j] / E[a_i]`
+    when only ordinary calibration is available, and 1.0 when neither is --
+    1.0 is exactly right when the twins fire at equal strength, which is
+    the regime a high Jaccard threshold selects for.
 
     Chains resolve transitively: given twins (i, j) and (j, k), `k` is
     merged into `i`, not into the already-doomed `j`.
@@ -200,11 +202,11 @@ class TwinRedundancySelector(NeuronSelector):
         keep = [i for i in range(ctx.num_neurons) if i not in self.drop_indices]
         merge_map = None
         if self.merge:
-            stats = ctx.stats
-            mean = None if stats is None else stats.mean
             merge_map = {}
             for dropped, survivor in self._survivor.items():
-                merge_map[dropped] = (survivor, _merge_scale(mean, dropped, survivor))
+                merge_map[dropped] = (
+                    survivor, _merge_scale(ctx.stats, dropped, survivor, ctx.cross_moments)
+                )
         return Selection.of(keep, merge_map=merge_map, num_neurons=ctx.num_neurons)
 
 
@@ -270,27 +272,46 @@ class WeightClusterRedundancySelector(NeuronSelector):
 
         merge_map = None
         if self.merge:
-            mean = None if ctx.stats is None else ctx.stats.mean
             merge_map = {
-                dropped: (survivor, _merge_scale(mean, dropped, survivor))
+                dropped: (survivor, _merge_scale(ctx.stats, dropped, survivor, ctx.cross_moments))
                 for dropped, survivor in survivor_of.items()
             }
         return Selection.of(sorted(keep), merge_map=merge_map, num_neurons=num_neurons)
 
 
-def _merge_scale(mean, dropped: int, survivor: int, eps: float = 1e-6) -> float:
-    """`E[a_dropped] / E[a_survivor]`, or 1.0 when that is unavailable or
-    numerically unsafe.
+def _merge_scale(stats, dropped: int, survivor: int, cross_moments=None, eps: float = 1e-6) -> float:
+    """The merge scale folding `dropped`'s output column into `survivor`'s.
 
-    Guarding on the denominator matters because a GELU neuron's *signed*
-    mean can sit near zero even when it is highly active, and an
-    unguarded ratio would then blow the merged column up by orders of
-    magnitude -- turning a conservative merge into a worse perturbation
-    than the plain drop it replaced.
+    Prefers the variance-minimizing scale `s* = E[a_dropped * a_survivor] /
+    E[a_survivor^2]` -- the `s` that minimizes `E[(a_dropped - s *
+    a_survivor)^2]`, i.e. the least-squares fit of `a_dropped` as a multiple
+    of `a_survivor` -- when `cross_moments` has the needed pair (from
+    `calibration.FFNCalibrator.collect_cross_moments`). `E[a_survivor^2]` is
+    `stats.rms[survivor] ** 2`, already computed by ordinary calibration;
+    only the cross term `E[a_dropped * a_survivor]` needs the extra pass.
+
+    Falls back to the mean-matching scale `E[a_dropped] / E[a_survivor]`
+    when no cross moment was supplied for this pair -- exactly what this
+    function computed before least-squares scales existed, so a caller
+    that never collects cross moments sees no change in behavior. Falls
+    back further to 1.0 when even that is unavailable or numerically
+    unsafe: a GELU neuron's *signed* mean can sit near zero even when it
+    is highly active, and an unguarded ratio would then blow the merged
+    column up by orders of magnitude -- turning a conservative merge into
+    a worse perturbation than the plain drop it replaced. `E[a^2] >= 0`,
+    so `rms[survivor] ** 2` is only ever unsafe by being too small, never
+    by cancellation the way the signed mean can be.
     """
-    if mean is None:
+    if stats is None:
         return 1.0
-    denom = float(mean[survivor])
+    if cross_moments is not None:
+        pair = (min(dropped, survivor), max(dropped, survivor))
+        cross = cross_moments.get(pair)
+        if cross is not None:
+            denom = float(stats.rms[survivor]) ** 2
+            if denom >= eps:
+                return cross / denom
+    denom = float(stats.mean[survivor])
     if abs(denom) < eps:
         return 1.0
-    return float(mean[dropped]) / denom
+    return float(stats.mean[dropped]) / denom

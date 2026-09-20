@@ -28,6 +28,54 @@ def test_stats_match_a_hand_computed_reference(model, batches):
     assert torch.allclose(stats.rms, valid.square().mean(dim=0).sqrt(), atol=1e-5)
 
 
+def test_cross_moments_match_a_hand_computed_reference(model, batches):
+    pairs = [(0, 3), (1, 2)]
+    cross = FFNCalibrator(model).collect_cross_moments(batches, layer_idx=0, pairs=pairs)
+
+    adapter = BertLayerAdapter(model)
+    captured = []
+    handle = adapter.get_activation_module(0).register_forward_hook(
+        lambda m, i, out: captured.append(out.detach())
+    )
+    with torch.no_grad():
+        for batch in batches:
+            model(**batch)
+    handle.remove()
+
+    valid = torch.cat([
+        acts.reshape(-1, acts.shape[-1])[b["attention_mask"].reshape(-1).bool()]
+        for acts, b in zip(captured, batches)
+    ])
+    for i, j in pairs:
+        expected = (valid[:, i] * valid[:, j]).mean().item()
+        assert cross[(i, j)] == pytest.approx(expected, abs=1e-5)
+
+
+def test_cross_moments_diagonal_matches_rms_squared(model, batches):
+    """`_merge_scale`'s least-squares denominator is `E[a_i^2] = rms_i^2` --
+    pin that a same-neuron "pair" agrees with ordinary `collect()`, since
+    the two are computed by entirely separate code paths.
+    """
+    stats = FFNCalibrator(model).collect(batches, layer_idx=0)
+    cross = FFNCalibrator(model).collect_cross_moments(batches, layer_idx=0, pairs=[(2, 2)])
+    assert cross[(2, 2)] == pytest.approx(float(stats.rms[2]) ** 2, abs=1e-5)
+
+
+def test_cross_moments_deduplicates_and_ignores_pair_order(model, batches):
+    calibrator = FFNCalibrator(model)
+    deduped = calibrator.collect_cross_moments(batches, layer_idx=0, pairs=[(0, 1), (1, 0), (0, 1)])
+    assert set(deduped) == {(0, 1)}
+
+
+def test_cross_moments_empty_pairs_returns_empty_dict(model, batches):
+    assert FFNCalibrator(model).collect_cross_moments(batches, layer_idx=0, pairs=[]) == {}
+
+
+def test_cross_moments_empty_calibration_is_an_explicit_error(model):
+    with pytest.raises(ValueError, match="no tokens"):
+        FFNCalibrator(model).collect_cross_moments([], layer_idx=0, pairs=[(0, 1)])
+
+
 def test_padding_tokens_are_excluded(model, batches):
     """Counting [PAD] positions would drag every mean toward whatever the
     model emits on padding -- an artifact of batching, not of the data.

@@ -118,6 +118,47 @@ def test_bias_compensation_preserves_the_mean_output():
     assert (mean_plain - mean_before).abs().max() > (mean_fixed - mean_before).abs().max()
 
 
+def test_least_squares_merge_scale_reduces_pointwise_error_versus_mean_matching():
+    """Both scales make bias compensation preserve the *mean* output exactly
+    (that's `_bias_compensation`'s job, not the scale's) -- the least-squares
+    scale `s* = E[a_dropped*a_survivor]/E[a_survivor^2]`'s actual payoff is a
+    smaller *pointwise* (per-token) reconstruction error, which comparing
+    means alone can't distinguish. See `selectors._merge_scale`.
+    """
+    intermediate, output = make_pair(hidden=6, neurons=8)
+    x = torch.randn(500, 6)
+    acts = torch.nn.functional.gelu(intermediate(x)).detach()
+
+    survivor, dropped = 1, 3
+    mean = acts.mean(dim=0)
+    rms = acts.square().mean(dim=0).sqrt()
+    stats = CalibrationStats(mean=mean, mean_abs=acts.abs().mean(dim=0), rms=rms, tokens=500)
+    cross = (acts[:, survivor] * acts[:, dropped]).mean().item()
+
+    mean_scale = float(mean[dropped] / mean[survivor])
+    least_squares_scale = cross / float(rms[survivor]) ** 2
+    assert mean_scale != pytest.approx(least_squares_scale)  # the two genuinely differ here
+
+    keep = [i for i in range(8) if i != dropped]
+    before = output(acts)
+
+    def merged_output(scale):
+        selection = Selection.of(keep, merge_map={dropped: (survivor, scale)}, num_neurons=8)
+        new_i, new_o = FFNSurgeon().resize(intermediate, output, selection, stats=stats, compensate_bias=True)
+        return new_o(torch.nn.functional.gelu(new_i(x)))
+
+    mean_matched = merged_output(mean_scale)
+    least_squares = merged_output(least_squares_scale)
+
+    # Both preserve the mean output...
+    assert torch.allclose(mean_matched.mean(dim=0), before.mean(dim=0), atol=1e-4)
+    assert torch.allclose(least_squares.mean(dim=0), before.mean(dim=0), atol=1e-4)
+    # ...but least-squares is the one actually minimizing per-token error.
+    mean_matched_err = (mean_matched - before).square().sum(dim=1).mean()
+    least_squares_err = (least_squares - before).square().sum(dim=1).mean()
+    assert least_squares_err < mean_matched_err
+
+
 def test_compensation_and_merge_do_not_double_count():
     """A merge already replays the dropped neuron's contribution, so
     compensation must only add the residual -- zero when the merge scale

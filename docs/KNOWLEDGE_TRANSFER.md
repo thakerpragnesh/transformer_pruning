@@ -101,7 +101,7 @@ transformer_pruning/
 │   ├── 01_vgg_saliency_demo.py
 │   ├── ...
 │   └── 11_global_multilayer_pruning.py
-├── tests/                    # 110 pytest tests — torch only, no GPU, no HuggingFace
+├── tests/                    # 121 pytest tests — torch only, no GPU, no HuggingFace
 │   ├── conftest.py           # StubBert: a BERT-shaped module tree built by hand
 │   └── test_*.py             # one file per package module (layers.py is covered in test_network_scanner.py)
 ├── docs/
@@ -166,7 +166,7 @@ python experiments/05_bert_mrpc_full_experiment.py
 pip install -e ".[dev]" && pytest
 ```
 
-110 tests, roughly half a second, **no GPU and no `transformers`/`datasets`
+121 tests, roughly half a second, **no GPU and no `transformers`/`datasets`
 required** — torch is the only real dependency. `tests/conftest.py` builds
 `StubBert`, a BERT-shaped `nn.Module` tree by hand, because the adapters only
 need the `encoder.layer[i]` *shape*, not HuggingFace itself. The side benefit
@@ -422,7 +422,7 @@ without a concrete reason:
   `RobertaModel`, which shares that layout).
 
 ### `context.py`
-- `FFNContext(intermediate_weight, output_weight, intermediate_bias=None, output_bias=None, stats=None, layer_index=None)`
+- `FFNContext(intermediate_weight, output_weight, intermediate_bias=None, output_bias=None, stats=None, layer_index=None, cross_moments=None)`
   — the read-only view a selector gets. **Why it exists:** selectors used to
   receive a bare `intermediate.weight`, which is structurally half a neuron —
   what a neuron actually contributes is `W_out[:, i] * act(W_in[i] @ x + b_i)`,
@@ -435,8 +435,14 @@ without a concrete reason:
     `AttributeError: 'NoneType'`). Also catches stats whose neuron count
     doesn't match the layer — usually stats collected against a different
     layer, or against this one *before* an earlier pruning pass.
-  - `.from_layers(intermediate, output, stats=None, layer_index=None)` —
-    build one from a live Linear pair. This is what `prune_ffn_layer` calls.
+  - `.cross_moments` — `{(i, j): E[a_i * a_j]}` for whichever pairs
+    `calibration.FFNCalibrator.collect_cross_moments` was asked to collect,
+    or `None`. Only `selectors._merge_scale` reads it, to prefer a
+    least-squares merge scale over the mean-matching fallback; every other
+    selector ignores the field entirely, and it defaults to `None` so
+    passing nothing behaves exactly as before this field existed.
+  - `.from_layers(intermediate, output, stats=None, layer_index=None, cross_moments=None)`
+    — build one from a live Linear pair. This is what `prune_ffn_layer` calls.
 - `Selection(keep_indices, merge_map=None)` — what a selector returns.
   `merge_map` maps a dropped neuron to `(survivor, scale)`; surgery adds
   `scale * W_out[:, dropped]` onto `W_out[:, survivor]`. `keep_indices` alone
@@ -480,6 +486,18 @@ without a concrete reason:
   `JaccardTwinFinder` compares *which tokens* two neurons fired on —
   information no summary statistic preserves. The calibrator throws per-token
   detail away because nothing downstream of it needs more than a mean.
+- `FFNCalibrator.collect_cross_moments(batches, layer_idx, pairs, max_batches=None) -> dict`
+  — the one *pairwise* exception: `{(i, j): E[a_i * a_j]}` for exactly the
+  `(i, j)` pairs asked for (order and duplicates in `pairs` don't matter; the
+  returned dict is keyed `(min(i,j), max(i,j))`). This is what
+  `selectors.TwinRedundancySelector`'s least-squares merge scale needs and
+  `.collect()` can't give it — `.collect()` only ever produces per-neuron
+  (diagonal) moments. Deliberately a separate pass over the calibration
+  corpus rather than a field on every `CalibrationStats`: the full
+  `(neurons, neurons)` cross-moment matrix nothing else needs would cost
+  `O(neurons²)` memory unconditionally, where the pairs a merge-capable
+  selector actually needs are typically a handful of twins, not everyone
+  against everyone. Same streaming/masking/dtype guarantees as `.collect()`.
 
 ### `scoring.py`
 - `SaliencyScorer` (ABC) — `score(weight) -> Tensor`, one score per output
@@ -576,8 +594,14 @@ without a concrete reason:
     merged into `i` with scale `s`, the merge already reintroduces
     `s * W_out[:, j] * a_i`, so only the residual
     `W_out[:, j] * (E[a_j] - s*E[a_i])` is added — zero exactly when the
-    scale was `E[a_j]/E[a_i]`. Handling both in one expression is what keeps
-    merge and compensation from double-counting each other.
+    scale was the mean-matching `E[a_j]/E[a_i]`, and generally *nonzero* (but
+    still exactly computed and added) for the least-squares scale
+    `selectors._merge_scale` prefers when it can, since that scale is chosen
+    to minimize pointwise error, not to zero the mean residual by
+    construction. Either way the mean output ends up exactly preserved;
+    handling both scale and residual in one expression is what keeps merge
+    and compensation from double-counting each other regardless of which
+    scale produced `s`.
 
 ### `attention_surgery.py`
 - `AttentionSurgeon.resize(query, key, value, output, num_heads, head_indices)`
@@ -647,13 +671,30 @@ without a concrete reason:
   - With `merge=True` it emits a `merge_map` so the dropped twin's output
     column is folded into its survivor rather than discarded — if `a_j ≈ a_i`
     then `W_out[:, j] * a_j ≈ W_out[:, j] * a_i`, so adding `W_out[:, j]` onto
-    `W_out[:, i]` reproduces the removed contribution. The scale is
-    `E[a_j] / E[a_i]` from calibration when available, and **1.0 otherwise**
-    — which is also the fallback when the denominator is near zero. That guard
-    matters: a GELU neuron's *signed* mean can sit near zero while the neuron
-    is highly active, and an unguarded ratio would then blow the merged column
-    up by orders of magnitude, turning a conservative merge into a worse
-    perturbation than the plain drop it replaced.
+    `W_out[:, i]` reproduces the removed contribution. The scale, in order of
+    preference (see `_merge_scale`):
+    1. **Least-squares**, `E[a_j * a_i] / E[a_i^2]` — the `s` minimizing
+       `E[(a_j - s*a_i)^2]` — when `ctx.cross_moments` has the pair (from
+       `calibration.FFNCalibrator.collect_cross_moments`). `E[a_i^2]` is
+       `stats.rms[i] ** 2`, already available from ordinary calibration.
+    2. **Mean-matching**, `E[a_j] / E[a_i]`, when only `ctx.stats` is
+       available (no cross moment for this pair, or its denominator was too
+       near zero) — what this scale always was before least-squares scales
+       existed.
+    3. **1.0**, when neither is available or numerically safe. That guard
+       matters: a GELU neuron's *signed* mean can sit near zero while the
+       neuron is highly active, and an unguarded ratio would then blow the
+       merged column up by orders of magnitude, turning a conservative merge
+       into a worse perturbation than the plain drop it replaced.
+
+    Whichever scale is used, `ffn_surgery.FFNSurgeon._bias_compensation`
+    still preserves the layer's *mean* output exactly — it computes whatever
+    residual `E[a_j] - scale*E[a_i]` results, without assuming which formula
+    produced `scale`. The least-squares scale's actual payoff is a smaller
+    *pointwise* (per-token) error, not a better mean (comparing means alone
+    can't tell the two scales apart) — see
+    `test_least_squares_merge_scale_reduces_pointwise_error_versus_mean_matching`
+    in `tests/test_ffn_surgery.py`.
   - **Ignores weight magnitudes entirely** (it reads `ctx.num_neurons`, and
     `ctx.stats` when merging) — correct, not a bug: the signal here is
     behavioral. It still takes the same `FFNContext` as every other selector
@@ -698,15 +739,20 @@ without a concrete reason:
   so it isn't behind an interface).
 
 ### `pruning_workflow.py`
-- `prune_ffn_layer(model, layer_index, selector, surgeon=None, adapter=None, stats=None, compensate_bias=False)`
+- `prune_ffn_layer(model, layer_index, selector, surgeon=None, adapter=None, stats=None, compensate_bias=False, cross_moments=None)`
   — one layer. Defaults `surgeon` to a fresh `FFNSurgeon()` and `adapter` to
   `BertLayerAdapter(model)`. Builds the `FFNContext`, asks the selector for a
   `Selection`, hands it to the surgeon, re-attaches via the adapter, returns
-  the number of neurons kept.
-- `prune_model_ffn(model, selector, layer_indices=None, allocation="uniform", surgeon=None, adapter=None, stats_by_layer=None, compensate_bias=False, normalize="mean", min_keep_ratio=0.1)`
+  the number of neurons kept. `cross_moments` (from
+  `FFNCalibrator.collect_cross_moments`) only matters to a merge-capable
+  selector's least-squares scale; every other selector ignores it.
+- `prune_model_ffn(model, selector, layer_indices=None, allocation="uniform", surgeon=None, adapter=None, stats_by_layer=None, compensate_bias=False, normalize="mean", min_keep_ratio=0.1, cross_moments_by_layer=None)`
   — the whole stack; returns `{layer_index: n_kept}`. `layer_indices` defaults
   to `range(adapter.num_layers())`; `stats_by_layer` is a
-  `{layer_index: CalibrationStats}` dict.
+  `{layer_index: CalibrationStats}` dict; `cross_moments_by_layer` is
+  `{layer_index: {(i, j): E[a_i * a_j]}}`, and only ever consulted under
+  `allocation="uniform"` — `"global"` requires an `ImportanceSelector`, which
+  never merges.
   - `allocation="uniform"` just applies the selector per layer — each layer
     loses the selector's own `prune_percent`.
   - `allocation="global"` treats `prune_percent` as a *model-wide* budget:
@@ -853,6 +899,21 @@ Note every flow calls the *exact same* `prune_ffn_layer` — the only thing that
 changes is which `NeuronSelector` is constructed. This is the payoff of the
 OCP/LSP design: adding a criterion means writing another `NeuronSelector`
 subclass, never touching `prune_ffn_layer` or `FFNSurgeon`.
+
+Add `cross_moments` to prefer the least-squares merge scale over the
+mean-matching fallback (same twins, same `stats`, one extra calibration pass
+for exactly the pairs being merged):
+
+```python
+cross_moments = FFNCalibrator(model.bert).collect_cross_moments(
+    batches, layer_idx=0, pairs=[(a, b) for a, b, _ in twins],
+)
+kept = prune_ffn_layer(
+    model.bert, layer_index=0,
+    selector=TwinRedundancySelector(twins, merge=True),
+    stats=stats, compensate_bias=True, cross_moments=cross_moments,
+)
+```
 
 ### Pruning the whole FFN stack, uniform vs. global
 

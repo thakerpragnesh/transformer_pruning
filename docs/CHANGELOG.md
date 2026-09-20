@@ -28,6 +28,26 @@
   open. `prune_attention_heads` takes head indices directly rather than a
   selector, so whichever criterion answers that question can drive it
   without a package change.
+- **Least-squares merge scales** — `TwinRedundancySelector` /
+  `WeightClusterRedundancySelector` now use the variance-minimizing scale
+  `s* = E[a_dropped·a_survivor]/E[a_survivor²]` when it's available, instead
+  of always falling back to the mean-matching `s = E[a_dropped]/E[a_survivor]`
+  (see 0.2.0's "Deferred" below for the math). `E[a_survivor²]` was already
+  `CalibrationStats.rms²`; the missing piece,
+  `FFNCalibrator.collect_cross_moments(batches, layer_idx, pairs)`, computes
+  the off-diagonal `E[a_i·a_j]` for exactly the pairs a caller names —
+  never a full `(neurons, neurons)` Gram matrix, which nothing else needs
+  and would cost `O(neurons²)` memory unconditionally. Both scale-preserving
+  guarantees this replaces still hold: `_bias_compensation` doesn't assume
+  which formula produced `scale`, it just corrects whatever mean residual
+  results, so mean-output preservation is exact under either scale — the
+  least-squares scale's actual payoff is a smaller *pointwise* error, which
+  comparing means can't see (see
+  `test_least_squares_merge_scale_reduces_pointwise_error_versus_mean_matching`
+  in `tests/test_ffn_surgery.py`). Threaded through as an opt-in
+  `cross_moments`/`cross_moments_by_layer` argument on `FFNContext`,
+  `prune_ffn_layer`, and `prune_model_ffn`; a caller that never collects
+  cross moments sees no change in behavior.
 
 ## 0.2.0 — 2026-09-19
 
@@ -152,8 +172,10 @@ Recorded because both were confidently stated before being checked.
 
 ### Deferred
 
-- **Attention-head pruning surgery.** Implemented since — see "Unreleased"
-  above.
+Both items below are implemented now — see "Unreleased" above — kept here
+for the original reasoning.
+
+- **Attention-head pruning surgery.**
 - **Least-squares merge scales.** `TwinRedundancySelector` uses
   `s = E[a_j]/E[a_i]`, which only matches the *means*. Minimizing
   `E[(a_j − s·a_i)²]` gives `s* = E[a_i·a_j]/E[a_i²]`. The denominator is

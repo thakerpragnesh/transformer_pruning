@@ -37,6 +37,11 @@ class FFNContext:
     output_bias: Optional[torch.Tensor] = None
     stats: Optional[Any] = None  # calibration.CalibrationStats; typed loosely to avoid a cycle
     layer_index: Optional[int] = None
+    # {(i, j): E[a_i * a_j]} for i < j, from calibration.FFNCalibrator.collect_cross_moments,
+    # restricted to whichever pairs a merge-capable selector actually needs (never a full
+    # (neurons, neurons) Gram matrix -- see TwinRedundancySelector / _merge_scale in
+    # selectors.py for why only these specific off-diagonal terms are worth computing).
+    cross_moments: Optional[dict] = None
 
     @property
     def num_neurons(self) -> int:
@@ -60,7 +65,8 @@ class FFNContext:
         return self.stats
 
     @classmethod
-    def from_layers(cls, intermediate, output, stats=None, layer_index=None) -> "FFNContext":
+    def from_layers(cls, intermediate, output, stats=None, layer_index=None,
+                    cross_moments=None) -> "FFNContext":
         """Build a context from a live `(intermediate, output)` Linear pair."""
         return cls(
             intermediate_weight=intermediate.weight.data,
@@ -69,6 +75,7 @@ class FFNContext:
             output_bias=None if output.bias is None else output.bias.data,
             stats=stats,
             layer_index=layer_index,
+            cross_moments=cross_moments,
         )
 
 

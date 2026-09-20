@@ -4,6 +4,7 @@ import torch
 from pruning_transformer import (
     AttentionHeadAnalyzer,
     BertLayerAdapter,
+    FFNCalibrator,
     InOutNormSelector,
     Max3SaliencyScorer,
     SaliencySelector,
@@ -182,6 +183,40 @@ def test_prune_attention_heads_keeps_head_analysis_correct_afterwards(model):
     prune_attention_heads(model, 0, head_indices=[0])
     heads = AttentionHeadAnalyzer(model).get_flat_heads(0)
     assert heads.shape[0] == 1
+
+
+def test_prune_ffn_layer_threads_cross_moments_into_the_merge_scale(model, batches):
+    """End-to-end wiring check: FFNCalibrator.collect_cross_moments ->
+    prune_ffn_layer's cross_moments= -> FFNContext -> TwinRedundancySelector's
+    merge. The scale's actual numerical payoff (a lower pointwise
+    reconstruction error than the mean-ratio fallback) is proven directly
+    against FFNSurgeon in test_ffn_surgery.py; this only pins that the
+    calibrated cross moment is what reaches the merge, not 1.0/the mean
+    fallback, by checking it against a hand-computed expectation.
+    """
+    stats = FFNCalibrator(model).collect(batches, layer_idx=0)
+    cross_moments = FFNCalibrator(model).collect_cross_moments(batches, layer_idx=0, pairs=[(2, 7)])
+    expected_scale = cross_moments[(2, 7)] / float(stats.rms[2]) ** 2
+
+    adapter = BertLayerAdapter(model)
+    _, output_before = adapter.get_ffn(0)
+    original_col2 = output_before.weight[:, 2].clone()
+    original_col7 = output_before.weight[:, 7].clone()
+
+    kept = prune_ffn_layer(
+        model, 0, TwinRedundancySelector([(2, 7)], merge=True),
+        stats=stats, cross_moments=cross_moments, compensate_bias=True,
+    )
+    assert kept == 15
+    with torch.no_grad():
+        model(**batches[0])  # shapes still line up end to end
+
+    # Neuron 2 keeps position 2 post-surgery (only neuron 7, at a higher
+    # index, was dropped), and now carries the scaled contribution of the
+    # original column 7 on top of its own original value.
+    _, output_after = adapter.get_ffn(0)
+    residual = output_after.weight[:, 2] - original_col2
+    assert torch.allclose(residual, original_col7 * expected_scale, atol=1e-5)
 
 
 def test_unsupported_adapter_methods_explain_themselves():

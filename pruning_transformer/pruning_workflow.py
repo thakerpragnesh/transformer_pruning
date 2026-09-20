@@ -29,13 +29,19 @@ from .selectors import ImportanceSelector
 
 
 def prune_ffn_layer(model, layer_index, selector, surgeon=None, adapter=None, stats=None,
-                    compensate_bias=False):
-    """Prune one layer's FFN. Returns the number of neurons kept."""
+                    compensate_bias=False, cross_moments=None):
+    """Prune one layer's FFN. Returns the number of neurons kept.
+
+    `cross_moments` (from `calibration.FFNCalibrator.collect_cross_moments`)
+    is only consulted by a merge-capable selector's least-squares scale
+    (`selectors._merge_scale`); every other selector ignores it.
+    """
     surgeon = surgeon or FFNSurgeon()
     adapter = adapter or BertLayerAdapter(model)
 
     intermediate, output = adapter.get_ffn(layer_index)
-    ctx = FFNContext.from_layers(intermediate, output, stats=stats, layer_index=layer_index)
+    ctx = FFNContext.from_layers(intermediate, output, stats=stats, layer_index=layer_index,
+                                 cross_moments=cross_moments)
     selection = selector.select(ctx)
     new_intermediate, new_output = surgeon.resize(
         intermediate, output, selection, stats=stats, compensate_bias=compensate_bias
@@ -67,7 +73,7 @@ def prune_attention_heads(model, layer_index, head_indices, surgeon=None, adapte
 
 def prune_model_ffn(model, selector, layer_indices=None, allocation="uniform", surgeon=None,
                     adapter=None, stats_by_layer=None, compensate_bias=False,
-                    normalize="mean", min_keep_ratio=0.1):
+                    normalize="mean", min_keep_ratio=0.1, cross_moments_by_layer=None):
     """Prune every FFN block in the model. Returns `{layer_index: n_kept}`.
 
     `allocation="uniform"` applies `selector` to each layer
@@ -92,10 +98,17 @@ def prune_model_ffn(model, selector, layer_indices=None, allocation="uniform", s
 
     `min_keep_ratio` floors how much of any single layer the global mode
     may take, so an unlucky ranking cannot collapse a layer entirely.
+
+    `cross_moments_by_layer` (`{layer_index: {(i, j): E[a_i * a_j]}}`, from
+    `calibration.FFNCalibrator.collect_cross_moments`) only matters for
+    `allocation="uniform"` with a merge-capable selector -- `"global"`
+    requires an `ImportanceSelector`, which never merges, so there is
+    nothing here for it to consult.
     """
     adapter = adapter or BertLayerAdapter(model)
     surgeon = surgeon or FFNSurgeon()
     stats_by_layer = stats_by_layer or {}
+    cross_moments_by_layer = cross_moments_by_layer or {}
 
     if layer_indices is None:
         layer_indices = list(range(adapter.num_layers()))
@@ -105,6 +118,7 @@ def prune_model_ffn(model, selector, layer_indices=None, allocation="uniform", s
             idx: prune_ffn_layer(
                 model, idx, selector, surgeon=surgeon, adapter=adapter,
                 stats=stats_by_layer.get(idx), compensate_bias=compensate_bias,
+                cross_moments=cross_moments_by_layer.get(idx),
             )
             for idx in layer_indices
         }

@@ -17,6 +17,15 @@ complementary, not redundant: the recorder keeps per-token detail because
 `redundancy.JaccardTwinFinder` needs to compare firing *patterns*; the
 calibrator throws per-token detail away because nothing downstream of it
 needs more than a mean.
+
+`FFNCalibrator.collect_cross_moments` is the one exception to "per-neuron
+only": a handful of specific *pairwise* moments `E[a_i * a_j]`, computed on
+request for whichever pairs `selectors.TwinRedundancySelector`'s
+least-squares merge scale needs (see `selectors._merge_scale`). It stays a
+separate pass rather than a field on `CalibrationStats` because the full
+`(neurons, neurons)` cross-moment matrix nothing else needs would be
+`O(neurons^2)` memory for every calibration run, not just the ones asking
+for it.
 """
 from dataclasses import dataclass
 
@@ -151,6 +160,78 @@ class FFNCalibrator:
             rms=(totals["sq_sum"] / n).sqrt().float(),
             tokens=n,
         )
+
+
+    def collect_cross_moments(self, batches, layer_idx: int, pairs, max_batches: int = None) -> dict:
+        """`{(i, j): E[a_i * a_j]}` for each `(i, j)` in `pairs`, `i < j`.
+
+        `TwinRedundancySelector`'s least-squares merge scale needs this
+        off-diagonal moment (see `selectors._merge_scale`); `collect()`
+        alone only ever gives per-neuron moments (`mean`, `mean_abs`,
+        `rms`), which is exactly the diagonal. A full `(neurons, neurons)`
+        cross-moment matrix would answer this for free, but at
+        `O(neurons^2)` memory for a stat almost nothing else needs -- this
+        instead takes the specific pairs a merge-capable selector actually
+        asked about (typically a handful of twin pairs, not every pair),
+        which is why it is a separate pass from `collect()` rather than an
+        unconditional extra field on every `CalibrationStats`.
+
+        `pairs` is any iterable of `(i, j)` index pairs; order and
+        duplicates in the input don't matter, the same pair is only ever
+        computed once. Returns a plain `dict` (not a `CalibrationStats`)
+        since there is no fixed-size per-neuron vector to hang it on.
+        """
+        unique_pairs = sorted({(min(int(i), int(j)), max(int(i), int(j))) for i, j in pairs})
+        if not unique_pairs:
+            return {}
+        left_idx = torch.tensor([p[0] for p in unique_pairs], dtype=torch.long)
+        right_idx = torch.tensor([p[1] for p in unique_pairs], dtype=torch.long)
+
+        module = self.adapter.get_activation_module(layer_idx)
+        device = _model_device(self.model)
+
+        totals = {"sum": None, "tokens": 0}
+        state = {"mask": None}
+
+        def hook(_module, _inputs, output):
+            acts = output.reshape(-1, output.shape[-1])
+            mask = state["mask"]
+            if mask is not None:
+                acts = acts[mask.reshape(-1).to(torch.bool)]
+            if acts.shape[0] == 0:
+                return
+            acts = acts.detach().float()
+            products = acts[:, left_idx.to(acts.device)] * acts[:, right_idx.to(acts.device)]
+            batch_sum = products.sum(dim=0).double().cpu()
+            if totals["sum"] is None:
+                totals["sum"] = batch_sum
+            else:
+                totals["sum"] += batch_sum
+            totals["tokens"] += acts.shape[0]
+
+        was_training = self.model.training
+        self.model.eval()
+        handle = module.register_forward_hook(hook)
+        try:
+            for i, batch in enumerate(batches):
+                if max_batches is not None and i >= max_batches:
+                    break
+                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+                batch.pop("labels", None)
+                state["mask"] = batch.get("attention_mask")
+                with torch.no_grad():
+                    self.model(**batch)
+        finally:
+            handle.remove()
+            state["mask"] = None
+            if was_training:
+                self.model.train()
+
+        if totals["tokens"] == 0:
+            raise ValueError("Calibration saw no tokens -- `batches` was empty or fully masked.")
+
+        cross = (totals["sum"] / totals["tokens"]).tolist()
+        return {pair: value for pair, value in zip(unique_pairs, cross)}
 
 
 def _model_device(model) -> torch.device:

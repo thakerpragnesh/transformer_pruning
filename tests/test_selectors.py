@@ -14,11 +14,11 @@ from pruning_transformer import (
 )
 
 
-def make_ctx(neurons=10, hidden=4, stats=None):
+def make_ctx(neurons=10, hidden=4, stats=None, cross_moments=None):
     torch.manual_seed(0)
     intermediate = nn.Linear(hidden, neurons)
     output = nn.Linear(neurons, hidden)
-    return FFNContext.from_layers(intermediate, output, stats=stats)
+    return FFNContext.from_layers(intermediate, output, stats=stats, cross_moments=cross_moments)
 
 
 def test_saliency_selector_keeps_the_strongest():
@@ -135,6 +135,87 @@ def test_twin_merge_scale_falls_back_to_one_without_calibration():
     ctx = make_ctx(neurons=4, stats=None)
     selection = TwinRedundancySelector([(0, 1)], merge=True).select(ctx)
     assert selection.merge_map[1] == (0, 1.0)
+
+
+def test_twin_merge_scale_prefers_least_squares_when_cross_moments_given():
+    """s* = E[a_1 * a_0] / E[a_0^2] minimizes E[(a_1 - s*a_0)^2] -- the
+    reconstruction error the merge is actually trying to minimize -- unlike
+    the mean-matching ratio, which only guarantees the *average* residual is
+    zero (that's `_bias_compensation`'s job, not the scale's).
+    """
+    stats = CalibrationStats(
+        mean=torch.tensor([1.0, 2.0, 1.0, 1.0]), mean_abs=torch.ones(4),
+        rms=torch.tensor([2.0, 3.0, 1.0, 1.0]), tokens=10,
+    )
+    cross_moments = {(0, 1): 5.0}  # E[a_0 * a_1]
+    ctx = make_ctx(neurons=4, stats=stats, cross_moments=cross_moments)
+
+    selection = TwinRedundancySelector([(0, 1)], merge=True).select(ctx)
+    assert selection.merge_map[1] == (0, pytest.approx(5.0 / 2.0 ** 2))  # E[a0*a1] / E[a0^2]
+    # Not the mean-matching answer (1.0 / 2.0) -- proves cross_moments, not
+    # mean, actually drove the scale.
+    assert selection.merge_map[1][1] != pytest.approx(1.0 / 2.0)
+
+
+def test_twin_merge_scale_is_keyed_regardless_of_dropped_survivor_order():
+    """`cross_moments` is keyed `(min, max)`. `TwinRedundancySelector` always
+    drops the *higher*-indexed neuron of a pair (dropped > survivor), but
+    `WeightClusterRedundancySelector` picks the highest-L1-norm cluster
+    member as survivor regardless of index (dropped can be lower), so both
+    orderings need covering.
+    """
+    stats = CalibrationStats(
+        mean=torch.tensor([1.0, 2.0, 1.0, 1.0]), mean_abs=torch.ones(4),
+        rms=torch.tensor([2.0, 3.0, 1.0, 1.0]), tokens=10,
+    )
+    cross_moments = {(0, 1): 5.0}
+
+    twin_ctx = make_ctx(neurons=4, stats=stats, cross_moments=cross_moments)
+    dropped_is_higher = TwinRedundancySelector([(0, 1)], merge=True).select(twin_ctx)
+    assert dropped_is_higher.merge_map[1] == (0, pytest.approx(5.0 / 2.0 ** 2))  # E[a0*a1]/E[a0^2]
+
+    # Same setup as test_weight_cluster_selector_merge_uses_calibration_scale:
+    # neuron 0 (same direction as 1, but not the louder one) is the one
+    # dropped, into survivor 1 -- the reverse index order from the twin case.
+    intermediate = nn.Linear(4, 6)
+    output = nn.Linear(6, 4)
+    with torch.no_grad():
+        intermediate.weight[1] = intermediate.weight[0] * 3.0
+    cluster_stats = CalibrationStats(
+        mean=torch.ones(6), mean_abs=torch.ones(6), rms=torch.tensor([2.0, 3.0, 1.0, 1.0, 1.0, 1.0]),
+        tokens=10,
+    )
+    cluster_ctx = FFNContext.from_layers(
+        intermediate, output, stats=cluster_stats, cross_moments=cross_moments,
+    )
+    dropped_is_lower = WeightClusterRedundancySelector(prune_percent=20, merge=True).select(cluster_ctx)
+    assert dropped_is_lower.merge_map[0] == (1, pytest.approx(5.0 / 3.0 ** 2))  # E[a0*a1]/E[a1^2]
+
+
+def test_twin_merge_scale_falls_back_to_mean_when_pair_missing_from_cross_moments():
+    """`cross_moments` was collected for *some* pairs, just not this one --
+    still a graceful fallback to the mean-matching scale, not 1.0.
+    """
+    stats = CalibrationStats(
+        mean=torch.tensor([1.0, 2.0, 1.0, 1.0]), mean_abs=torch.ones(4),
+        rms=torch.ones(4), tokens=10,
+    )
+    ctx = make_ctx(neurons=4, stats=stats, cross_moments={(2, 3): 1.0})
+    selection = TwinRedundancySelector([(0, 1)], merge=True).select(ctx)
+    assert selection.merge_map[1] == (0, 2.0)  # unchanged from the no-cross-moments behavior
+
+
+def test_twin_merge_scale_falls_back_to_mean_when_least_squares_denominator_is_near_zero():
+    """`E[a_survivor^2]` (rms^2) near zero is the least-squares path's own
+    guard -- distinct from the mean-ratio guard, and checked first.
+    """
+    stats = CalibrationStats(
+        mean=torch.tensor([1.0, 2.0, 1.0, 1.0]), mean_abs=torch.ones(4),
+        rms=torch.tensor([1e-9, 1.0, 1.0, 1.0]), tokens=10,
+    )
+    ctx = make_ctx(neurons=4, stats=stats, cross_moments={(0, 1): 5.0})
+    selection = TwinRedundancySelector([(0, 1)], merge=True).select(ctx)
+    assert selection.merge_map[1] == (0, 2.0)  # falls back to E[a1]/E[a0] = 2.0/1.0
 
 
 def test_weight_cluster_selector_validates_prune_percent():
