@@ -86,6 +86,27 @@ class LpNormScorer(SaliencyScorer):
         return torch.linalg.vector_norm(flat, ord=self.p, dim=1)
 
 
+class CSDScorer(SaliencyScorer):
+    """Per output unit, the L1 dispersion of its incoming weights from
+    their own mean: `sum(|w - mean(w)|)`.
+
+    Adapted from the "Custom Standard Deviation" (CSD) in Thaker & Mohan,
+    "Enhancing Deep Compression of CNNs" (IEEE Access, 2024), which used
+    dispersion as a training-time regularization target -- channels with
+    low dispersion were pushed toward zero by an `L1Norm/CSD` loss added
+    to the fine-tuning objective, then removed once shrunk. Used directly
+    as a scorer here instead: a unit whose incoming weights are nearly
+    uniform contributes a roughly constant signal regardless of the
+    input -- indistinguishable from a bias term -- while high dispersion
+    means the unit actually discriminates between inputs. No retraining
+    pass is needed to compute it, unlike the source paper's regularizer.
+    """
+
+    def score(self, weight: torch.Tensor) -> torch.Tensor:
+        flat = weight.detach().reshape(weight.shape[0], -1)
+        return (flat - flat.mean(dim=1, keepdim=True)).abs().sum(dim=1)
+
+
 def lowest_scoring(scorer: SaliencyScorer, weight: torch.Tensor, amount: int):
     """Convenience for one-off lookups: the `amount` lowest-scoring units
     for a single weight tensor, as `[index, score]` pairs.

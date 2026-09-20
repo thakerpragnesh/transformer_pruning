@@ -61,10 +61,29 @@ noise to discard, it is signal `W_out[:, i] * a_i` can carry.
 
 | Selector | Sees | Idea |
 |---|---|---|
-| `SaliencySelector` | `W_in` | Any `SaliencyScorer` — the thesis's Max-3 rule, or an Lp norm |
+| `SaliencySelector` | `W_in` | Any `SaliencyScorer` — the thesis's Max-3 rule, an Lp norm, or `CSDScorer` |
 | `InOutNormSelector` | `W_in`, `W_out` | `‖W_in[i]‖ · ‖W_out[:,i]‖` — a neuron nothing reads is worthless however hard it's driven |
 | `ActivationAwareSelector` | `W_out`, activations | `‖W_out[:,i]‖ · E[\|a_i\|]` — measures *use*, not just capacity |
-| `TwinRedundancySelector` | firing patterns | Behavioural redundancy; can merge rather than drop |
+| `TwinRedundancySelector` | firing patterns | Behavioural redundancy (co-activation on real data); can merge rather than drop |
+| `WeightClusterRedundancySelector` | `W_in` direction | Weight-space redundancy (K-means on incoming-weight direction); can also merge |
+
+`CSDScorer` scores a neuron by the L1 dispersion of `W_in[i]` from its own
+mean, rather than magnitude — a row of near-uniform weights contributes a
+roughly constant signal (indistinguishable from a bias), so low dispersion
+means low informativeness. Adapted as a one-shot post-hoc criterion from the
+group-regularization loss in Thaker & Mohan, *"Enhancing Deep Compression of
+CNNs"* (IEEE Access, 2024), which used the same dispersion measure as a
+training-time penalty instead.
+
+`WeightClusterRedundancySelector` is the weight-space counterpart to
+`TwinRedundancySelector`: instead of behavioral co-activation, it clusters
+neurons by `W_in` direction (L2-normalized, via from-scratch k-means in
+`clustering.py`) and keeps the highest-L1-norm neuron per cluster, adapted
+from the K-Means channel-selection method in Thaker & Mohan, *"Channel
+Pruning of Transfer Learning Models Using Novel Techniques"* (IEEE Access,
+2024). Where that paper had to condense a 2D conv kernel into a per-channel
+feature vector before clustering, a BERT FFN neuron's `W_in` row already
+*is* that feature vector, so no condensing step is needed.
 
 Weight-only criteria measure how strongly a neuron is *wired*. They
 cannot see that a well-wired neuron may almost never fire on the target
@@ -101,6 +120,12 @@ Two corrections apply to any criterion, both in `FFNSurgeon`:
   surgery meet.
 - **`head_analysis.py`** — `AttentionHeadAnalyzer`: cosine similarity and
   Lp-distance between attention heads, with a `normalize` flag.
+- **`attention_surgery.py`** — `AttentionSurgeon`: the compression half of
+  head redundancy — physically removes head rows from `query`/`key`/`value`
+  and the matching columns from `attention.output.dense`. No merge or bias
+  compensation here: a head's contribution is a function of the input, not
+  a per-neuron constant. `pruning_workflow.prune_attention_heads` wires it
+  to a live model.
 - **`calibration.py`** — `FFNCalibrator`: streams batches and accumulates
   per-neuron activation moments without materialising the full
   `(tokens, neurons)` tensor.
@@ -110,6 +135,10 @@ Two corrections apply to any criterion, both in `FFNSurgeon`:
 - **`redundancy.py`** — `JaccardTwinFinder`: flags neuron pairs with
   near-identical firing patterns (true Jaccard/IoU) as redundant "twins",
   and reports neurons that never fire at all.
+- **`clustering.py`** — `kmeans_assign`: from-scratch Lloyd's-algorithm
+  k-means, no external ML dependency. Used by
+  `WeightClusterRedundancySelector`; a standalone utility because
+  clustering is a strategy in its own right, not selector bookkeeping.
 
 ## Usage
 

@@ -63,7 +63,7 @@ def test_unknown_metric_is_rejected(model):
 
 
 def test_indivisible_head_layout_is_rejected(model):
-    model.config.num_attention_heads = 3  # 8 is not divisible by 3
+    model.encoder.layer[0].attention.self.num_attention_heads = 3  # 8 is not divisible by 3
     with pytest.raises(ValueError, match="not divisible"):
         AttentionHeadAnalyzer(model).get_flat_heads(0)
 

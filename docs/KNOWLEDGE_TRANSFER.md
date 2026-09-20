@@ -84,13 +84,16 @@ transformer_pruning/
 │   ├── model_adapter.py     # FFNLayerAdapter, AttentionLayerAdapter, BertLayerAdapter
 │   ├── context.py           # FFNContext, Selection — what a selector sees and returns
 │   ├── calibration.py       # CalibrationStats, FFNCalibrator
-│   ├── scoring.py           # SaliencyScorer, TopKMagnitudeScorer, Max3SaliencyScorer, LpNormScorer, lowest_scoring
+│   ├── scoring.py           # SaliencyScorer, TopKMagnitudeScorer, Max3SaliencyScorer, LpNormScorer, CSDScorer, lowest_scoring
 │   ├── network_scanner.py   # NetworkSaliencyScanner
 │   ├── head_analysis.py     # AttentionHeadAnalyzer
 │   ├── ffn_surgery.py       # FFNSurgeon
+│   ├── attention_surgery.py # AttentionSurgeon
 │   ├── selectors.py         # NeuronSelector, ImportanceSelector, SaliencySelector,
-│   │                        #   InOutNormSelector, ActivationAwareSelector, TwinRedundancySelector
-│   ├── pruning_workflow.py  # prune_ffn_layer, prune_model_ffn (the orchestration entry points)
+│   │                        #   InOutNormSelector, ActivationAwareSelector, TwinRedundancySelector,
+│   │                        #   WeightClusterRedundancySelector
+│   ├── clustering.py        # kmeans_assign (from-scratch k-means, no external ML dependency)
+│   ├── pruning_workflow.py  # prune_ffn_layer, prune_model_ffn, prune_attention_heads (the orchestration entry points)
 │   ├── activation_recording.py  # ActivationRecorder
 │   └── redundancy.py        # JaccardTwinFinder
 ├── experiments/              # 11 runnable scripts, one per exploration stage
@@ -98,7 +101,7 @@ transformer_pruning/
 │   ├── 01_vgg_saliency_demo.py
 │   ├── ...
 │   └── 11_global_multilayer_pruning.py
-├── tests/                    # 86 pytest tests — torch only, no GPU, no HuggingFace
+├── tests/                    # 110 pytest tests — torch only, no GPU, no HuggingFace
 │   ├── conftest.py           # StubBert: a BERT-shaped module tree built by hand
 │   └── test_*.py             # one file per package module (layers.py is covered in test_network_scanner.py)
 ├── docs/
@@ -163,7 +166,7 @@ python experiments/05_bert_mrpc_full_experiment.py
 pip install -e ".[dev]" && pytest
 ```
 
-86 tests, roughly half a second, **no GPU and no `transformers`/`datasets`
+110 tests, roughly half a second, **no GPU and no `transformers`/`datasets`
 required** — torch is the only real dependency. `tests/conftest.py` builds
 `StubBert`, a BERT-shaped `nn.Module` tree by hand, because the adapters only
 need the `encoder.layer[i]` *shape*, not HuggingFace itself. The side benefit
@@ -204,7 +207,7 @@ graph TD
         NSel["NeuronSelector<br/>.select(ctx) → Selection"]
         ISel["ImportanceSelector<br/>.importance(ctx) → Tensor"]
         FA["FFNLayerAdapter<br/>.get_ffn / .set_ffn<br/>(+ optional .get_activation_module / .num_layers)"]
-        AA["AttentionLayerAdapter<br/>.num_attention_heads / .hidden_size / .get_query_weight"]
+        AA["AttentionLayerAdapter<br/>.num_attention_heads(layer_idx) / .hidden_size / .get_query_weight<br/>.get_attention_heads / .set_attention_heads"]
     end
 
     Max3["Max3SaliencyScorer<br/>LpNormScorer"] -.implements.-> SS
@@ -226,6 +229,8 @@ graph TD
     Workflow -- "uses" --> Surgeon["FFNSurgeon"]
     Sel -- "consumed by" --> Surgeon
     HeadAn["AttentionHeadAnalyzer"] -- "depends on" --> AA
+    AttnWorkflow["prune_attention_heads()"] -- "depends on" --> AA
+    AttnWorkflow -- "uses" --> AttnSurgeon["AttentionSurgeon"]
     Calib["FFNCalibrator"] -- "depends on" --> FA
     Calib -- "produces" --> Stats["CalibrationStats"]
     Stats -- "feeds" --> ActAware
@@ -243,7 +248,7 @@ graph TD
 | `NeuronSelector` | `selectors.py` | `select(ctx: FFNContext) -> Selection`; default implementation wraps `select_keep_indices(ctx) -> list` | `ImportanceSelector` subclasses, `TwinRedundancySelector` | `prune_ffn_layer` |
 | `ImportanceSelector` | `selectors.py` | `importance(ctx: FFNContext) -> Tensor` (higher survives); inherits the budget arithmetic | `SaliencySelector`, `InOutNormSelector`, `ActivationAwareSelector` | `prune_model_ffn(allocation="global")` |
 | `FFNLayerAdapter` | `model_adapter.py` | `get_ffn(layer_idx)`, `set_ffn(layer_idx, intermediate, output)`; optionally `get_activation_module(layer_idx)`, `num_layers()` | `BertLayerAdapter` | `prune_ffn_layer`, `prune_model_ffn`, `ActivationRecorder`, `FFNCalibrator` |
-| `AttentionLayerAdapter` | `model_adapter.py` | `num_attention_heads`, `hidden_size`, `get_query_weight(layer_idx)` | `BertLayerAdapter` | `AttentionHeadAnalyzer` |
+| `AttentionLayerAdapter` | `model_adapter.py` | `num_attention_heads(layer_idx)`, `hidden_size`, `get_query_weight(layer_idx)`, `get_attention_heads(layer_idx)`, `set_attention_heads(layer_idx, query, key, value, output, num_heads)` | `BertLayerAdapter` | `AttentionHeadAnalyzer`, `prune_attention_heads` |
 
 Two plain data carriers travel between them, both in `context.py`:
 
@@ -348,6 +353,13 @@ without a concrete reason:
   extra mechanics the surgeon performs on instruction, not alternative
   policies. The policy (which neurons, merged into which) is entirely in the
   `Selection` the selector produced.
+- **`AttentionSurgeon`** (`attention_surgery.py`) is likewise a concrete
+  class: given a layer's Q/K/V/output Linears, a head count, and which heads
+  to drop, there is exactly one correct row/column slice. It takes bare
+  Linears rather than an adapter, the same separation `FFNSurgeon` keeps —
+  the adapter's job (`set_attention_heads`) is installing the result back
+  onto the model *and* keeping the model's own head-count bookkeeping
+  consistent, which is model-layout-specific in a way tensor slicing is not.
 - **`FFNContext` / `Selection` / `CalibrationStats`** are frozen dataclasses,
   not interfaces. They are data crossing a boundary; there is no behaviour to
   vary.
@@ -394,8 +406,14 @@ without a concrete reason:
     is not simply `get_ffn(...)[0]`.
   - `num_layers()` — only `prune_model_ffn` needs it, and only when
     `layer_indices` is not given explicitly.
-- `AttentionLayerAdapter` (ABC) — `num_attention_heads` (property),
-  `hidden_size` (property), `get_query_weight(layer_idx)`.
+- `AttentionLayerAdapter` (ABC) — `num_attention_heads(layer_idx)` (a
+  per-layer *method*, not a model-wide property: `attention_surgery` can
+  shrink one layer's head count independently of the others, and
+  `BertLayerAdapter` reads it straight off that layer's own self-attention
+  module rather than the shared `config.num_attention_heads`), `hidden_size`
+  (property), `get_query_weight(layer_idx)`, `get_attention_heads(layer_idx)
+  -> (query, key, value, output)`, `set_attention_heads(layer_idx, query,
+  key, value, output, num_heads)`.
 - `TransformerLayerAdapter` — `FFNLayerAdapter + AttentionLayerAdapter`,
   nothing added on top. Only exists so `BertLayerAdapter` has one type name
   to inherit that satisfies both.
@@ -480,6 +498,13 @@ without a concrete reason:
 - `LpNormScorer(p=2.0)` — the standard magnitude baseline Max-3 is meant to
   beat, kept here so one scanner can report both rather than an experiment
   hand-rolling the comparison.
+- `CSDScorer` — per output unit, `sum(|w - mean(w)|)`: dispersion from the
+  row's own mean, not magnitude. Adapted from the "Custom Standard
+  Deviation" training-time regularizer in Thaker & Mohan, *"Enhancing Deep
+  Compression of CNNs"* (IEEE Access, 2024, `L1Norm/CSD` loss), used here
+  directly as a one-shot post-hoc score instead — no retraining pass
+  required. A near-uniform row is nearly a constant/bias regardless of
+  input; high dispersion means the unit actually discriminates.
 - `lowest_scoring(scorer, weight, amount)` — convenience free function: the
   `amount` lowest-scoring unit indices + their scores, as `[index, score]`
   pairs. Used for one-off single-layer lookups (see `experiments/01`).
@@ -506,8 +531,13 @@ without a concrete reason:
 - `AttentionHeadAnalyzer(model=None, adapter=None)` — pass either a raw
   HuggingFace model (wrapped in `BertLayerAdapter` automatically) or a
   pre-built `AttentionLayerAdapter`. Raises `ValueError` if neither is given.
-  - `.get_flat_heads(layer_idx)` → `(num_heads, head_dim * hidden_size / num_heads)`-shaped tensor of each head's flattened query weights. Raises if
-    `hidden_size` isn't divisible by `num_attention_heads`.
+  - `.get_flat_heads(layer_idx)` → `(num_heads, head_dim * hidden_size)`-shaped
+    tensor of each head's flattened query weights, where `num_heads` and
+    `head_dim` come from the *layer's own* query weight shape and
+    `adapter.num_attention_heads(layer_idx)` — not the model's global
+    `hidden_size` — so this stays correct on a layer
+    `attention_surgery.prune_attention_heads` has already resized. Raises if
+    the query weight's output size isn't divisible by `num_attention_heads`.
   - `.compute_similarity(layer_idx)` → cosine similarity matrix (heads
     unit-normalized first).
   - `.compute_distance_matrix(layer_idx, metric="manhattan", normalize=False)`
@@ -548,6 +578,34 @@ without a concrete reason:
     `W_out[:, j] * (E[a_j] - s*E[a_i])` is added — zero exactly when the
     scale was `E[a_j]/E[a_i]`. Handling both in one expression is what keeps
     merge and compensation from double-counting each other.
+
+### `attention_surgery.py`
+- `AttentionSurgeon.resize(query, key, value, output, num_heads, head_indices)`
+  — the attention-block counterpart to `FFNSurgeon.resize`. `query`/`key`/
+  `value` are `(hidden, hidden)` Linears whose *output* rows partition into
+  `num_heads` head-sized blocks (HuggingFace's layout: head `h` owns rows
+  `[h*head_dim, (h+1)*head_dim)`); `output` is the attention block's output
+  projection, whose *input* columns partition the same way, since its input
+  is the heads' concatenated context vectors. Returns
+  `(new_query, new_key, new_value, new_output, new_num_heads)` — like
+  `FFNSurgeon`, it does not mutate the model in place; the caller
+  (`prune_attention_heads`) re-attaches the result via the adapter.
+  - **No merge, no bias compensation.** A dropped head's contribution is a
+    function of the input (its attention pattern over the sequence), not a
+    per-neuron constant a bias term can absorb, so there is no cheap
+    correction to apply here the way there is for a dropped FFN neuron.
+  - **Which heads to drop is not this class's decision.** `head_indices` comes
+    from the caller — `AttentionHeadAnalyzer`'s similarity/distance matrices
+    are one candidate signal, but query-weight cosine similarity is a known
+    weak one (two heads with similar Q but different V do different jobs);
+    see `docs/CHANGELOG.md`'s "Deferred" section under 0.2.0.
+  - **Validation** mirrors `FFNSurgeon`'s: out-of-range head indices,
+    removing every head, `num_heads` not dividing the Q/K/V output size, and
+    an inconsistent Q/K/V/output quartet all raise with an explanation.
+  - **dtype/device/`requires_grad` preservation** and `bias=None` support,
+    same guarantees as `FFNSurgeon`. The output projection's *bias* is left
+    untouched by construction — it's indexed by hidden size, not head, so no
+    head removal ever needs to touch it.
 
 ### `selectors.py`
 - `NeuronSelector` (ABC) — `select(ctx: FFNContext) -> Selection` is the
@@ -600,6 +658,44 @@ without a concrete reason:
     `ctx.stats` when merging) — correct, not a bug: the signal here is
     behavioral. It still takes the same `FFNContext` as every other selector
     to stay substitutable (LSP).
+- `WeightClusterRedundancySelector(prune_percent, min_keep=1, merge=False, kmeans_iters=50, seed=0)`
+  — the weight-space counterpart to `TwinRedundancySelector`: redundancy from
+  what a neuron *is* (its `W_in` direction) rather than how it behaves on
+  real data, so it needs no activation corpus. Adapted from the K-Means
+  channel-selection method in Thaker & Mohan, *"Channel Pruning of Transfer
+  Learning Models Using Novel Techniques"* (IEEE Access, 2024): cluster
+  channels by weight similarity, keep the highest-L1-norm channel per
+  cluster. That paper had to condense a 2D conv kernel into a per-channel
+  feature vector first (their Equation 1); a BERT FFN neuron's `W_in` row
+  already *is* that feature vector, so no condensing step exists here.
+  - Rows are L2-normalized before clustering (`clustering.kmeans_assign`),
+    unlike the source paper — clusters form on weight *direction*, not
+    magnitude, so a neuron pointed the same way as another is a redundancy
+    candidate even if it fires much louder. `merge=True` compensates for
+    that magnitude gap with the same calibration-derived scale
+    `TwinRedundancySelector` uses (`_merge_scale`, shared module-level
+    function).
+  - `prune_percent`/`min_keep` share `ImportanceSelector`'s exact budget
+    arithmetic (`_keep_count`, `_validate_budget` — extracted to module level
+    so the two don't duplicate the rounding rule from Section 10.1 bug 6).
+    It is a plain `NeuronSelector`, not an `ImportanceSelector`: cluster
+    membership isn't a per-neuron scalar, so it works with
+    `allocation="uniform"` but not `prune_model_ffn(allocation="global")`,
+    same as `TwinRedundancySelector`.
+
+### `clustering.py`
+- `kmeans_assign(x, k, iters=50, seed=0)` — from-scratch Lloyd's-algorithm
+  k-means, pure torch, no external ML dependency (the package depends only
+  on torch/numpy/pandas — see Section 3). Returns a `(n,)` LongTensor of
+  cluster ids. Centroids are seeded from a seeded `torch.randperm`, so
+  results are reproducible independent of any global RNG state that the
+  caller (or a prior test) may have left behind. An empty cluster keeps its
+  previous centroid rather than being reseeded — a from-scratch k-means is
+  the deliberately simple half of `WeightClusterRedundancySelector`; the
+  policy of "which representative survives a cluster" belongs to the
+  selector (Section 4.2's reasoning for why `FFNSurgeon` stays a concrete
+  class applies here too — there's one correct way to run Lloyd's algorithm,
+  so it isn't behind an interface).
 
 ### `pruning_workflow.py`
 - `prune_ffn_layer(model, layer_index, selector, surgeon=None, adapter=None, stats=None, compensate_bias=False)`
@@ -643,6 +739,21 @@ without a concrete reason:
   than the budget rather than let a ranking artifact collapse a layer — so
   total compression can come in under the nominal `prune_percent`, and the
   returned `{layer: n_kept}` dict is the honest record of what happened.
+- `prune_attention_heads(model, layer_index, head_indices, surgeon=None, adapter=None)`
+  — one layer's attention block. Defaults `surgeon` to a fresh
+  `AttentionSurgeon()` and `adapter` to `BertLayerAdapter(model)`. Unlike FFN
+  pruning there is no selector: which heads to remove is a criterion
+  `AttentionHeadAnalyzer` informs but does not decide by itself (see the
+  open question in Section 10.1's "Deferred"), so the caller passes
+  `head_indices` directly. Fetches the layer's Q/K/V/output via
+  `adapter.get_attention_heads`, resizes, and re-attaches via
+  `adapter.set_attention_heads` — which also updates the layer's own
+  `num_attention_heads`/`attention_head_size`/`all_head_size`, the
+  bookkeeping `BertSelfAttention.forward` actually reshapes Q/K/V by.
+  Returns the number of heads kept. Which heads to pass in is still an open
+  research question (`docs/CHANGELOG.md`'s "Deferred" section under 0.2.0);
+  cosine similarity on raw query weight is one candidate signal, not the
+  only defensible one.
 
 ### `activation_recording.py`
 - `ActivationRecorder(model, tokenizer, adapter=None, batch_size=32, max_length=None)`
@@ -773,14 +884,19 @@ report = scanner.scan()          # pandas DataFrame
 weakest = scanner.weakest_units("features.24", n=5)
 ```
 
-### Attention-head redundancy
+### Attention-head redundancy, and acting on it
 
 ```python
-from pruning_transformer import AttentionHeadAnalyzer
+from pruning_transformer import AttentionHeadAnalyzer, prune_attention_heads
 
 analyzer = AttentionHeadAnalyzer(model)   # BertLayerAdapter built automatically
 sim = analyzer.compute_similarity(layer_idx=10)
 dist = analyzer.compute_distance_matrix(layer_idx=10, metric="manhattan", normalize=True)
+
+# analyzer only diagnoses; prune_attention_heads is the compression step,
+# and takes head indices directly -- it does not pick a criterion for you.
+redundant_heads = [c for r, c in zip(*(sim > 0.90).nonzero()) if r < c]
+kept = prune_attention_heads(model, layer_index=10, head_indices=redundant_heads)
 ```
 
 ### Targeting a non-BERT model (extension example)

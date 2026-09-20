@@ -1,5 +1,6 @@
 """High-level orchestration: apply any `NeuronSelector` to a
-transformer's FFN blocks via `FFNSurgeon`.
+transformer's FFN blocks via `FFNSurgeon`, or a list of head indices to
+its attention blocks via `AttentionSurgeon`.
 
 This is the one place that wires a selection strategy to surgery
 mechanics. Everything else in this package depends only on the abstract
@@ -20,6 +21,7 @@ distributed across depth.
 """
 import torch
 
+from .attention_surgery import AttentionSurgeon
 from .context import FFNContext, Selection
 from .ffn_surgery import FFNSurgeon
 from .model_adapter import BertLayerAdapter
@@ -40,6 +42,27 @@ def prune_ffn_layer(model, layer_index, selector, surgeon=None, adapter=None, st
     )
     adapter.set_ffn(layer_index, new_intermediate, new_output)
     return len(selection.keep_indices)
+
+
+def prune_attention_heads(model, layer_index, head_indices, surgeon=None, adapter=None):
+    """Remove the given attention heads from one layer. Returns the number
+    of heads kept.
+
+    Unlike FFN pruning, there is no `NeuronSelector` here: which heads to
+    remove is a criterion `head_analysis.AttentionHeadAnalyzer` informs (a
+    similarity or distance matrix) but does not decide by itself, so the
+    caller passes `head_indices` directly rather than a strategy object.
+    """
+    surgeon = surgeon or AttentionSurgeon()
+    adapter = adapter or BertLayerAdapter(model)
+
+    query, key, value, output = adapter.get_attention_heads(layer_index)
+    num_heads = adapter.num_attention_heads(layer_index)
+    new_query, new_key, new_value, new_output, new_num_heads = surgeon.resize(
+        query, key, value, output, num_heads, head_indices
+    )
+    adapter.set_attention_heads(layer_index, new_query, new_key, new_value, new_output, new_num_heads)
+    return new_num_heads
 
 
 def prune_model_ffn(model, selector, layer_indices=None, allocation="uniform", surgeon=None,

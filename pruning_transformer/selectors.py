@@ -27,8 +27,30 @@ The criteria, in rough order of how much they know:
 from abc import ABC, abstractmethod
 
 import torch
+import torch.nn.functional as F
 
+from .clustering import kmeans_assign
 from .context import FFNContext, Selection
+
+
+def _validate_budget(prune_percent: float, min_keep: int) -> None:
+    if not 0 <= prune_percent < 100:
+        raise ValueError(
+            f"prune_percent must be in [0, 100), got {prune_percent}. "
+            "100 would delete every neuron in the layer."
+        )
+    if min_keep < 1:
+        raise ValueError(f"min_keep must be >= 1, got {min_keep}")
+
+
+def _keep_count(num_neurons: int, prune_percent: float, min_keep: int) -> int:
+    # round, not truncate. int() always truncates toward zero, so it
+    # prunes one neuron more than asked whenever the product isn't whole
+    # -- e.g. 768 neurons at 40% keeps 460 rather than 461. Small per
+    # layer, but it is a one-directional bias that compounds across a
+    # whole-model sweep.
+    keep = round(num_neurons * (1 - prune_percent / 100))
+    return max(min_keep, min(num_neurons, keep))
 
 
 class NeuronSelector(ABC):
@@ -58,13 +80,7 @@ class ImportanceSelector(NeuronSelector):
     """
 
     def __init__(self, prune_percent: float, min_keep: int = 1):
-        if not 0 <= prune_percent < 100:
-            raise ValueError(
-                f"prune_percent must be in [0, 100), got {prune_percent}. "
-                "100 would delete every neuron in the layer."
-            )
-        if min_keep < 1:
-            raise ValueError(f"min_keep must be >= 1, got {min_keep}")
+        _validate_budget(prune_percent, min_keep)
         self.prune_percent = prune_percent
         self.min_keep = min_keep
 
@@ -73,13 +89,7 @@ class ImportanceSelector(NeuronSelector):
         """Return one importance score per neuron; higher survives."""
 
     def n_keep(self, num_neurons: int) -> int:
-        # round, not truncate. int() always truncates toward zero, so it
-        # prunes one neuron more than asked whenever the product isn't whole
-        # -- e.g. 768 neurons at 40% keeps 460 rather than 461. Small per
-        # layer, but it is a one-directional bias that compounds across a
-        # whole-model sweep.
-        keep = round(num_neurons * (1 - self.prune_percent / 100))
-        return max(self.min_keep, min(num_neurons, keep))
+        return _keep_count(num_neurons, self.prune_percent, self.min_keep)
 
     def select_keep_indices(self, ctx: FFNContext) -> list:
         scores = self.importance(ctx)
@@ -196,6 +206,76 @@ class TwinRedundancySelector(NeuronSelector):
             for dropped, survivor in self._survivor.items():
                 merge_map[dropped] = (survivor, _merge_scale(mean, dropped, survivor))
         return Selection.of(keep, merge_map=merge_map, num_neurons=ctx.num_neurons)
+
+
+class WeightClusterRedundancySelector(NeuronSelector):
+    """Groups neurons by incoming-weight *direction* and keeps one
+    representative per cluster -- redundancy detected from what a neuron
+    *is* (its weight vector), which complements `TwinRedundancySelector`
+    seeing redundancy from how a neuron *behaves* on real data. Needs no
+    calibration corpus to run (though calibration still improves the
+    merge, if requested).
+
+    Adapted from the K-Means channel-selection method in Thaker & Mohan,
+    "Channel Pruning of Transfer Learning Models Using Novel Techniques"
+    (IEEE Access, 2024): cluster channels by weight similarity, then keep
+    the highest-L1-norm channel per cluster and prune the rest. Ported
+    from conv channels to FFN neurons -- a BERT neuron's `W_in` row is
+    already the 1D feature vector that paper had to condense a 2D kernel
+    down to (their Equation 1), so no condensing step is needed here.
+
+    Rows are L2-normalized before clustering, unlike the source paper, so
+    clusters form on weight *direction* rather than magnitude: two
+    neurons pointing the same way are redundant candidates even if one
+    fires much louder than the other, and merging (with calibration)
+    compensates for that magnitude gap via the same scale
+    `TwinRedundancySelector` uses.
+    """
+
+    def __init__(
+        self,
+        prune_percent: float,
+        min_keep: int = 1,
+        merge: bool = False,
+        kmeans_iters: int = 50,
+        seed: int = 0,
+    ):
+        _validate_budget(prune_percent, min_keep)
+        self.prune_percent = prune_percent
+        self.min_keep = min_keep
+        self.merge = merge
+        self.kmeans_iters = kmeans_iters
+        self.seed = seed
+
+    def select(self, ctx: FFNContext) -> Selection:
+        num_neurons = ctx.num_neurons
+        n_clusters = _keep_count(num_neurons, self.prune_percent, self.min_keep)
+        if n_clusters >= num_neurons:
+            return Selection.of(list(range(num_neurons)), num_neurons=num_neurons)
+
+        w_in = ctx.intermediate_weight.detach().float()
+        directions = F.normalize(w_in, p=2, dim=1, eps=1e-12)
+        assignment = kmeans_assign(directions, n_clusters, iters=self.kmeans_iters, seed=self.seed)
+
+        l1_norms = w_in.abs().sum(dim=1)
+        keep = []
+        survivor_of = {}
+        for cluster in torch.unique(assignment).tolist():
+            members = (assignment == cluster).nonzero(as_tuple=True)[0].tolist()
+            representative = max(members, key=lambda i: l1_norms[i].item())
+            keep.append(representative)
+            for member in members:
+                if member != representative:
+                    survivor_of[member] = representative
+
+        merge_map = None
+        if self.merge:
+            mean = None if ctx.stats is None else ctx.stats.mean
+            merge_map = {
+                dropped: (survivor, _merge_scale(mean, dropped, survivor))
+                for dropped, survivor in survivor_of.items()
+            }
+        return Selection.of(sorted(keep), merge_map=merge_map, num_neurons=num_neurons)
 
 
 def _merge_scale(mean, dropped: int, survivor: int, eps: float = 1e-6) -> float:

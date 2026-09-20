@@ -78,17 +78,42 @@ class FFNLayerAdapter(ABC):
 class AttentionLayerAdapter(ABC):
     @property
     @abstractmethod
-    def num_attention_heads(self) -> int:
-        ...
-
-    @property
-    @abstractmethod
     def hidden_size(self) -> int:
         ...
 
     @abstractmethod
+    def num_attention_heads(self, layer_idx: int) -> int:
+        """How many attention heads layer `layer_idx` currently has.
+
+        Deliberately per-layer rather than a model-wide property:
+        `attention_surgery.prune_attention_heads` can remove heads from one
+        layer while leaving others untouched, so a single shared number --
+        such as `config.num_attention_heads` -- would be wrong for every
+        layer but the one just pruned. HuggingFace's own head-count
+        bookkeeping lives on the per-layer self-attention module for the
+        same reason; see `BertLayerAdapter.set_attention_heads`.
+        """
+
+    @abstractmethod
     def get_query_weight(self, layer_idx: int):
         """Return the layer's attention query projection weight."""
+
+    @abstractmethod
+    def get_attention_heads(self, layer_idx: int):
+        """Return `(query, key, value, output)` Linear modules for the
+        layer's multi-head attention block: `query`/`key`/`value` partition
+        their output rows into per-head blocks, `output` is the attention
+        block's output projection, whose input columns partition the same
+        way.
+        """
+
+    @abstractmethod
+    def set_attention_heads(self, layer_idx: int, query: nn.Linear, key: nn.Linear,
+                             value: nn.Linear, output: nn.Linear, num_heads: int) -> None:
+        """Install a resized `(query, key, value, output)` quartet and
+        update the per-layer head-count bookkeeping the model's own forward
+        pass relies on to reshape Q/K/V into heads.
+        """
 
 
 class TransformerLayerAdapter(FFNLayerAdapter, AttentionLayerAdapter):
@@ -107,12 +132,11 @@ class BertLayerAdapter(TransformerLayerAdapter):
         self.model = model
 
     @property
-    def num_attention_heads(self) -> int:
-        return self.model.config.num_attention_heads
-
-    @property
     def hidden_size(self) -> int:
         return self.model.config.hidden_size
+
+    def num_attention_heads(self, layer_idx: int) -> int:
+        return self.model.encoder.layer[layer_idx].attention.self.num_attention_heads
 
     def get_ffn(self, layer_idx: int):
         layer = self.model.encoder.layer[layer_idx]
@@ -133,3 +157,24 @@ class BertLayerAdapter(TransformerLayerAdapter):
 
     def get_query_weight(self, layer_idx: int):
         return self.model.encoder.layer[layer_idx].attention.self.query.weight.data
+
+    def get_attention_heads(self, layer_idx: int):
+        self_attn = self.model.encoder.layer[layer_idx].attention.self
+        output = self.model.encoder.layer[layer_idx].attention.output.dense
+        return self_attn.query, self_attn.key, self_attn.value, output
+
+    def set_attention_heads(self, layer_idx: int, query: nn.Linear, key: nn.Linear,
+                             value: nn.Linear, output: nn.Linear, num_heads: int) -> None:
+        layer = self.model.encoder.layer[layer_idx]
+        self_attn = layer.attention.self
+        self_attn.query, self_attn.key, self_attn.value = query, key, value
+        layer.attention.output.dense = output
+        # BertSelfAttention.forward reshapes Q/K/V using these three
+        # attributes, not config.num_attention_heads -- HuggingFace's own
+        # `prune_heads()` updates them the same way and deliberately leaves
+        # config alone (see docs/CHANGELOG.md, "Deferred"). Recomputing
+        # attention_head_size from the resized weight rather than trusting
+        # the old value catches a caller who passed heads of mismatched size.
+        self_attn.num_attention_heads = num_heads
+        self_attn.attention_head_size = query.weight.shape[0] // num_heads
+        self_attn.all_head_size = num_heads * self_attn.attention_head_size

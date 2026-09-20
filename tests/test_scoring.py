@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from pruning_transformer import LpNormScorer, Max3SaliencyScorer, TopKMagnitudeScorer, lowest_scoring
+from pruning_transformer import CSDScorer, LpNormScorer, Max3SaliencyScorer, TopKMagnitudeScorer, lowest_scoring
 
 
 def test_max3_linear_matches_reference():
@@ -46,6 +46,26 @@ def test_scoring_does_not_require_grad_or_mutate():
     w = torch.randn(4, 5, requires_grad=True)
     before = w.detach().clone()
     scores = Max3SaliencyScorer().score(w)
+    assert not scores.requires_grad
+    assert torch.equal(w.detach(), before)
+
+
+def test_csd_scorer_rewards_dispersion_not_magnitude():
+    # Row 0 is perfectly uniform (zero dispersion) despite nonzero weights;
+    # row 1 has the same L1 magnitude but is spread around its mean.
+    w = torch.tensor([
+        [5.0, 5.0, 5.0, 5.0],
+        [10.0, 0.0, 10.0, 0.0],
+    ])
+    scores = CSDScorer().score(w)
+    assert scores[0].item() == pytest.approx(0.0)
+    assert scores[1].item() == pytest.approx(20.0)
+
+
+def test_csd_scorer_does_not_require_grad_or_mutate():
+    w = torch.randn(4, 5, requires_grad=True)
+    before = w.detach().clone()
+    scores = CSDScorer().score(w)
     assert not scores.requires_grad
     assert torch.equal(w.detach(), before)
 

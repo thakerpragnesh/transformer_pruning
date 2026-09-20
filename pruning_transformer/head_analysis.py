@@ -29,19 +29,22 @@ class AttentionHeadAnalyzer:
         self.adapter = adapter
 
     def get_flat_heads(self, layer_idx: int) -> torch.Tensor:
-        num_heads = self.adapter.num_attention_heads
-        hidden = self.adapter.hidden_size
-        if hidden % num_heads:
-            raise ValueError(
-                f"hidden_size {hidden} is not divisible by num_attention_heads {num_heads}; "
-                "the adapter is reporting a head layout this model does not have."
-            )
-        head_dim = hidden // num_heads
+        num_heads = self.adapter.num_attention_heads(layer_idx)
         w_q = self.adapter.get_query_weight(layer_idx).detach()
-        # W_q is (hidden_out, hidden_in) and the head partition runs down
-        # the output rows, so reshaping dim 0 into (heads, head_dim) is
-        # what groups each head's rows together.
-        return w_q.reshape(num_heads, head_dim * w_q.shape[1]).float()
+        # W_q is (hidden_out, hidden_in). Reading the head split off
+        # `w_q.shape[0]` rather than the model's global `hidden_size`
+        # keeps this correct after `attention_surgery.prune_attention_heads`
+        # has shrunk this layer's heads independently of the others.
+        out_features, in_features = w_q.shape
+        if out_features % num_heads:
+            raise ValueError(
+                f"query output size {out_features} is not divisible by num_attention_heads "
+                f"{num_heads}; the adapter is reporting a head layout this layer does not have."
+            )
+        head_dim = out_features // num_heads
+        # The head partition runs down the output rows, so reshaping dim 0
+        # into (heads, head_dim) is what groups each head's rows together.
+        return w_q.reshape(num_heads, head_dim * in_features).float()
 
     def compute_similarity(self, layer_idx: int):
         heads = torch.nn.functional.normalize(self.get_flat_heads(layer_idx), p=2, dim=1)

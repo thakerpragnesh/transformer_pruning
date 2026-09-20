@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`AttentionSurgeon` / `prune_attention_heads`** — the compression half of
+  attention-head redundancy: physically removes head rows from `query`,
+  `key`, `value` (weight and bias) and the matching columns from
+  `attention.output.dense`, so heads `head_analysis.AttentionHeadAnalyzer`
+  flags as redundant can actually be cut, not just visualized. There is no
+  merge/bias-compensation option here (unlike `FFNSurgeon`) — a head's
+  contribution is a function of the input, not a per-neuron constant a bias
+  can absorb.
+- Fixed the `config.num_attention_heads` gotcha the surgery would otherwise
+  hit (see 0.2.0's "Deferred" below): `AttentionLayerAdapter.num_attention_heads`
+  is now a per-layer method reading the self-attention module's own
+  `num_attention_heads`/`attention_head_size`/`all_head_size`, matching how
+  HuggingFace's own `prune_heads()` tracks a post-prune head count — and
+  `set_attention_heads` updates those three attributes together, since
+  resizing the weights without them gives silently wrong attention, not a
+  shape error. `head_analysis.get_flat_heads` now derives head size from the
+  query weight's own shape rather than the model-wide `hidden_size`, so
+  analysis stays correct on a layer that has already been pruned.
+- The larger open question from 0.2.0's deferral — cosine similarity on raw
+  query weight is a weak redundancy signal; the OV circuit or an
+  attention-pattern similarity on real data would be stronger — is still
+  open. `prune_attention_heads` takes head indices directly rather than a
+  selector, so whichever criterion answers that question can drive it
+  without a package change.
+
 ## 0.2.0 — 2026-09-19
 
 A correctness, criteria, and infrastructure pass over the whole project.
@@ -123,18 +152,8 @@ Recorded because both were confidently stated before being checked.
 
 ### Deferred
 
-- **Attention-head pruning surgery.** `head_analysis.py` identifies redundant
-  heads and nothing can act on them, so stages 06–08 produce figures rather
-  than compression. Needs an `AttentionSurgeon` (delete head rows from Q/K/V
-  weights *and* biases, matching columns from `attention.output.dense`, and
-  update `num_attention_heads`/`all_head_size` — resizing weights without the
-  attribute bookkeeping gives silently wrong attention, not a shape error).
-  Note that HuggingFace's own `prune_heads` records `config.pruned_heads`
-  rather than decrementing `config.num_attention_heads`, which
-  `BertLayerAdapter.num_attention_heads` reads — so wrapping it needs care.
-  The larger question is the criterion: query-weight cosine similarity is weak
-  (two heads with similar Q but different V do different jobs); the OV circuit
-  or attention-pattern similarity on real data would be stronger.
+- **Attention-head pruning surgery.** Implemented since — see "Unreleased"
+  above.
 - **Least-squares merge scales.** `TwinRedundancySelector` uses
   `s = E[a_j]/E[a_i]`, which only matches the *means*. Minimizing
   `E[(a_j − s·a_i)²]` gives `s* = E[a_i·a_j]/E[a_i²]`. The denominator is

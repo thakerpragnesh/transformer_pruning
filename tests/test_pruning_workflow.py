@@ -2,11 +2,13 @@ import pytest
 import torch
 
 from pruning_transformer import (
+    AttentionHeadAnalyzer,
     BertLayerAdapter,
     InOutNormSelector,
     Max3SaliencyScorer,
     SaliencySelector,
     TwinRedundancySelector,
+    prune_attention_heads,
     prune_ffn_layer,
     prune_model_ffn,
 )
@@ -147,6 +149,39 @@ def test_twin_pruning_with_merge_end_to_end(model, batches):
     with torch.no_grad():
         after = model(**batches[0])
     assert torch.allclose(before, after, atol=1e-5)
+
+
+def test_prune_attention_heads_resizes_and_still_runs(model, batches):
+    adapter = BertLayerAdapter(model)
+    assert adapter.num_attention_heads(0) == 2
+
+    kept = prune_attention_heads(model, 0, head_indices=[0])
+    assert kept == 1
+    assert adapter.num_attention_heads(0) == 1
+
+    query, key, value, output = adapter.get_attention_heads(0)
+    assert query.out_features == 4 and key.out_features == 4 and value.out_features == 4
+    assert output.in_features == 4
+    with torch.no_grad():
+        model(**batches[0])  # shapes still line up end to end, including real attention
+
+
+def test_prune_attention_heads_leaves_other_layers_untouched(model):
+    adapter = BertLayerAdapter(model)
+    before = adapter.get_query_weight(1).clone()
+    prune_attention_heads(model, 0, head_indices=[0])
+    assert adapter.num_attention_heads(1) == 2
+    assert torch.equal(adapter.get_query_weight(1), before)
+
+
+def test_prune_attention_heads_keeps_head_analysis_correct_afterwards(model):
+    """Regression: num_attention_heads used to be a single model-wide
+    property, so AttentionHeadAnalyzer would keep dividing this layer's
+    (now smaller) query weight by the *original* head count.
+    """
+    prune_attention_heads(model, 0, head_indices=[0])
+    heads = AttentionHeadAnalyzer(model).get_flat_heads(0)
+    assert heads.shape[0] == 1
 
 
 def test_unsupported_adapter_methods_explain_themselves():

@@ -10,6 +10,7 @@ from pruning_transformer import (
     Max3SaliencyScorer,
     SaliencySelector,
     TwinRedundancySelector,
+    WeightClusterRedundancySelector,
 )
 
 
@@ -134,6 +135,62 @@ def test_twin_merge_scale_falls_back_to_one_without_calibration():
     ctx = make_ctx(neurons=4, stats=None)
     selection = TwinRedundancySelector([(0, 1)], merge=True).select(ctx)
     assert selection.merge_map[1] == (0, 1.0)
+
+
+def test_weight_cluster_selector_validates_prune_percent():
+    with pytest.raises(ValueError, match="must be in"):
+        WeightClusterRedundancySelector(prune_percent=100)
+
+
+def test_weight_cluster_selector_keeps_everyone_at_zero_percent():
+    ctx = make_ctx(neurons=6)
+    selection = WeightClusterRedundancySelector(prune_percent=0).select(ctx)
+    assert selection.keep_indices == list(range(6))
+    assert selection.merge_map is None
+
+
+def test_weight_cluster_selector_drops_a_direction_duplicate():
+    """Neuron 1 points the same way as neuron 0 (just louder) -- after
+    L2-normalizing rows before clustering, the two are identical points
+    and must land in the same cluster regardless of centroid init.
+    """
+    intermediate = nn.Linear(4, 6)
+    output = nn.Linear(6, 4)
+    with torch.no_grad():
+        intermediate.weight[1] = intermediate.weight[0] * 3.0
+    ctx = FFNContext.from_layers(intermediate, output)
+
+    selection = WeightClusterRedundancySelector(prune_percent=20).select(ctx)
+    assert len(selection.keep_indices) == 5
+    assert len({0, 1} & set(selection.keep_indices)) == 1
+
+
+def test_weight_cluster_selector_keeps_the_higher_l1_norm_representative():
+    intermediate = nn.Linear(4, 6)
+    output = nn.Linear(6, 4)
+    with torch.no_grad():
+        intermediate.weight[1] = intermediate.weight[0] * 3.0  # same direction, louder
+
+    ctx = FFNContext.from_layers(intermediate, output)
+    selection = WeightClusterRedundancySelector(prune_percent=20).select(ctx)
+    assert 1 in selection.keep_indices
+    assert 0 not in selection.keep_indices
+
+
+def test_weight_cluster_selector_merge_uses_calibration_scale():
+    intermediate = nn.Linear(4, 6)
+    output = nn.Linear(6, 4)
+    with torch.no_grad():
+        intermediate.weight[1] = intermediate.weight[0] * 3.0
+    stats = CalibrationStats(
+        mean=torch.tensor([1.0, 2.0, 1.0, 1.0, 1.0, 1.0]),
+        mean_abs=torch.ones(6), rms=torch.ones(6), tokens=10,
+    )
+    ctx = FFNContext.from_layers(intermediate, output, stats=stats)
+
+    selection = WeightClusterRedundancySelector(prune_percent=20, merge=True).select(ctx)
+    # Neuron 0 is dropped into survivor 1; E[a_0] / E[a_1] = 1.0 / 2.0.
+    assert selection.merge_map[0] == (1, 0.5)
 
 
 def test_twin_merge_scale_guards_a_near_zero_denominator():
