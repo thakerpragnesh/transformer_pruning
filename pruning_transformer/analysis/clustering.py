@@ -1,6 +1,6 @@
 """Pure K-means clustering: no autograd, no external ML dependency.
 
-Exists as its own module because `selectors.WeightClusterRedundancySelector`
+Exists as its own module because `ffn_selectors.WeightClusterRedundancySelector`
 is the only consumer today, but a from-scratch k-means over normalized
 weight vectors is a clustering strategy in its own right, not selector
 bookkeeping -- keeping it separate is what lets the selector focus purely
@@ -23,13 +23,16 @@ def kmeans_assign(x: torch.Tensor, k: int, iters: int = 50, seed: int = 0) -> to
     if not 1 <= k <= n:
         raise ValueError(f"k must be in [1, {n}], got {k}")
     if k == n:
-        return torch.arange(n)
+        return torch.arange(n, device=x.device)
 
     generator = torch.Generator(device="cpu").manual_seed(seed)
     seed_idx = torch.randperm(n, generator=generator)[:k]
     centroids = x[seed_idx].clone()
 
-    assignment = torch.full((n,), -1, dtype=torch.long)
+    # On the input's device, like `new_assignment` below -- `torch.equal`
+    # raises on tensors from two devices, so a CPU-side initial value broke
+    # clustering on GPU at the first convergence check.
+    assignment = torch.full((n,), -1, dtype=torch.long, device=x.device)
     for _ in range(iters):
         distances = torch.cdist(x, centroids)
         new_assignment = distances.argmin(dim=1)

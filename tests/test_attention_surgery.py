@@ -124,3 +124,50 @@ def test_mismatched_output_projection_is_rejected():
     wrong_output = nn.Linear(5, 8)
     with pytest.raises(ValueError, match="inconsistent"):
         AttentionSurgeon().resize(query, key, value, wrong_output, num_heads=2, head_indices=[0])
+
+
+# --- bias compensation ------------------------------------------------------
+
+def _stats_for(context_mean):
+    from pruning_transformer import HeadStats
+
+    heads = context_mean.shape[0]
+    return HeadStats(
+        context_mean=context_mean, contribution_rms=torch.ones(heads),
+        contribution_std=torch.ones(heads), tokens=1,
+    )
+
+
+def test_bias_compensation_preserves_the_mean_output_exactly():
+    """Dropping head h removes W_O[:, h] @ ctx_h; compensation adds back its
+    mean. On the very contexts the mean was taken over, the projection's
+    average output must therefore be unchanged."""
+    query, key, value, output = make_qkvo(hidden=16)  # 4 heads of 4
+    contexts = torch.randn(50, 16)
+    stats = _stats_for(contexts.reshape(50, 4, 4).mean(dim=0))
+    before = output(contexts).mean(dim=0)
+
+    _, _, _, new_o, _ = AttentionSurgeon().resize(
+        query, key, value, output, num_heads=4, head_indices=[1, 2], stats=stats,
+        compensate_bias=True,
+    )
+    kept_cols = torch.cat([torch.arange(0, 4), torch.arange(12, 16)])
+    after = new_o(contexts[:, kept_cols]).mean(dim=0)
+    assert torch.allclose(before, after, atol=1e-5)
+
+    plain = AttentionSurgeon().resize(query, key, value, output, num_heads=4, head_indices=[1, 2])[3]
+    assert not torch.allclose(before, plain(contexts[:, kept_cols]).mean(dim=0), atol=1e-3)
+
+
+def test_bias_compensation_needs_a_bias_and_matching_stats():
+    query, key, value, output = make_qkvo(hidden=16, bias=False)
+    with pytest.raises(ValueError, match="no bias"):
+        AttentionSurgeon().resize(query, key, value, output, num_heads=4, head_indices=[0],
+                                  stats=_stats_for(torch.zeros(4, 4)), compensate_bias=True)
+    query, key, value, output = make_qkvo(hidden=16)
+    with pytest.raises(ValueError, match="requires head calibration stats"):
+        AttentionSurgeon().resize(query, key, value, output, num_heads=4, head_indices=[0],
+                                  compensate_bias=True)
+    with pytest.raises(ValueError, match="already pruned"):
+        AttentionSurgeon().resize(query, key, value, output, num_heads=4, head_indices=[0],
+                                  stats=_stats_for(torch.zeros(3, 4)), compensate_bias=True)

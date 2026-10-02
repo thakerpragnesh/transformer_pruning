@@ -29,28 +29,9 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn.functional as F
 
-from .clustering import kmeans_assign
+from .budget import PruneBudgetMixin
+from ..analysis.clustering import kmeans_assign
 from .context import FFNContext, Selection
-
-
-def _validate_budget(prune_percent: float, min_keep: int) -> None:
-    if not 0 <= prune_percent < 100:
-        raise ValueError(
-            f"prune_percent must be in [0, 100), got {prune_percent}. "
-            "100 would delete every neuron in the layer."
-        )
-    if min_keep < 1:
-        raise ValueError(f"min_keep must be >= 1, got {min_keep}")
-
-
-def _keep_count(num_neurons: int, prune_percent: float, min_keep: int) -> int:
-    # round, not truncate. int() always truncates toward zero, so it
-    # prunes one neuron more than asked whenever the product isn't whole
-    # -- e.g. 768 neurons at 40% keeps 460 rather than 461. Small per
-    # layer, but it is a one-directional bias that compounds across a
-    # whole-model sweep.
-    keep = round(num_neurons * (1 - prune_percent / 100))
-    return max(min_keep, min(num_neurons, keep))
 
 
 class NeuronSelector(ABC):
@@ -71,25 +52,18 @@ class NeuronSelector(ABC):
         )
 
 
-class ImportanceSelector(NeuronSelector):
+class ImportanceSelector(PruneBudgetMixin, NeuronSelector):
     """Shared machinery for every "score each neuron, keep the best" rule.
 
-    Subclasses supply `importance(ctx)`; the budget arithmetic, the
-    guard against pruning a layer out of existence, and the top-k are
-    written once here rather than re-derived per criterion.
+    Subclasses supply `importance(ctx)`; the budget arithmetic and the
+    guard against pruning a layer out of existence come from
+    `budget.PruneBudgetMixin`, and the top-k is written once here rather
+    than re-derived per criterion.
     """
-
-    def __init__(self, prune_percent: float, min_keep: int = 1):
-        _validate_budget(prune_percent, min_keep)
-        self.prune_percent = prune_percent
-        self.min_keep = min_keep
 
     @abstractmethod
     def importance(self, ctx: FFNContext) -> torch.Tensor:
         """Return one importance score per neuron; higher survives."""
-
-    def n_keep(self, num_neurons: int) -> int:
-        return _keep_count(num_neurons, self.prune_percent, self.min_keep)
 
     def select_keep_indices(self, ctx: FFNContext) -> list:
         scores = self.importance(ctx)
@@ -141,7 +115,7 @@ class ActivationAwareSelector(ImportanceSelector):
     can be strongly wired and still near-useless because it almost never
     fires on the target distribution -- common in a fine-tuned model,
     where the pretrained FFN carries capacity the downstream task never
-    exercises. Requires calibration (`calibration.FFNCalibrator`).
+    exercises. Requires calibration (`ffn_calibration.FFNCalibrator`).
 
     `statistic` picks which activation moment scales the output norm:
     `"mean_abs"` (default) for average contribution magnitude, or
@@ -185,18 +159,38 @@ class TwinRedundancySelector(NeuronSelector):
     def __init__(self, twin_pairs, merge: bool = False):
         self.twin_pairs = list(twin_pairs)
         self.merge = merge
-        # survivor[j] = the neuron j is represented by. Union-find style
-        # path compression keeps chains from pointing at dropped neurons.
-        self._survivor = {}
+        # Union-find over the twin graph: every connected group of twins
+        # collapses onto its lowest index. Resolving each pair on its own
+        # made the result depend on pair order -- `JaccardTwinFinder` sorts
+        # by overlap, not index, so (4, 6) arriving before (1, 4) mapped 6
+        # into 4 and then dropped 4, a merge into a removed neuron.
+        parent = {}
+
+        def find(node):
+            root = node
+            while parent.get(root, root) != root:
+                root = parent[root]
+            while parent.get(node, node) != root:
+                parent[node], node = root, parent[node]
+            return root
+
         for pair in self.twin_pairs:
-            a, b = int(pair[0]), int(pair[1])
-            low, high = min(a, b), max(a, b)
-            root = low
-            while root in self._survivor:
-                root = self._survivor[root]
-            if high != root:
-                self._survivor[high] = root
+            root_a, root_b = find(int(pair[0])), find(int(pair[1]))
+            if root_a != root_b:
+                parent[max(root_a, root_b)] = min(root_a, root_b)
+
+        # survivor[j] = the neuron j is represented by, always a root.
+        self._survivor = {node: find(node) for node in parent}
         self.drop_indices = set(self._survivor)
+
+    @property
+    def merge_pairs(self) -> list:
+        """`[(dropped, survivor), ...]`, sorted -- the pairs a merge folds,
+        and so the pairs `FFNCalibrator.collect_cross_moments` must measure
+        for the least-squares scale. Not the same as `twin_pairs`: a chain
+        (i, j), (j, k) merges `k` into `i`, a pair no twin list names.
+        """
+        return sorted(self._survivor.items())
 
     def select(self, ctx: FFNContext) -> Selection:
         keep = [i for i in range(ctx.num_neurons) if i not in self.drop_indices]
@@ -210,7 +204,7 @@ class TwinRedundancySelector(NeuronSelector):
         return Selection.of(keep, merge_map=merge_map, num_neurons=ctx.num_neurons)
 
 
-class WeightClusterRedundancySelector(NeuronSelector):
+class WeightClusterRedundancySelector(PruneBudgetMixin, NeuronSelector):
     """Groups neurons by incoming-weight *direction* and keeps one
     representative per cluster -- redundancy detected from what a neuron
     *is* (its weight vector), which complements `TwinRedundancySelector`
@@ -242,16 +236,14 @@ class WeightClusterRedundancySelector(NeuronSelector):
         kmeans_iters: int = 50,
         seed: int = 0,
     ):
-        _validate_budget(prune_percent, min_keep)
-        self.prune_percent = prune_percent
-        self.min_keep = min_keep
+        super().__init__(prune_percent, min_keep)
         self.merge = merge
         self.kmeans_iters = kmeans_iters
         self.seed = seed
 
     def select(self, ctx: FFNContext) -> Selection:
         num_neurons = ctx.num_neurons
-        n_clusters = _keep_count(num_neurons, self.prune_percent, self.min_keep)
+        n_clusters = self.n_keep(num_neurons)
         if n_clusters >= num_neurons:
             return Selection.of(list(range(num_neurons)), num_neurons=num_neurons)
 
@@ -270,6 +262,18 @@ class WeightClusterRedundancySelector(NeuronSelector):
                 if member != representative:
                     survivor_of[member] = representative
 
+        # K-Means can leave clusters empty -- always when fewer distinct
+        # directions exist than clusters asked for (duplicate or all-zero
+        # rows) -- and one survivor per non-empty cluster would then prune
+        # more than `prune_percent`. Refill the budget with the strongest
+        # remaining neurons, which stop being merged away.
+        shortfall = n_clusters - len(keep)
+        if shortfall > 0:
+            extra = sorted(survivor_of, key=lambda i: l1_norms[i].item(), reverse=True)[:shortfall]
+            for member in extra:
+                keep.append(member)
+                del survivor_of[member]
+
         merge_map = None
         if self.merge:
             merge_map = {
@@ -286,7 +290,7 @@ def _merge_scale(stats, dropped: int, survivor: int, cross_moments=None, eps: fl
     E[a_survivor^2]` -- the `s` that minimizes `E[(a_dropped - s *
     a_survivor)^2]`, i.e. the least-squares fit of `a_dropped` as a multiple
     of `a_survivor` -- when `cross_moments` has the needed pair (from
-    `calibration.FFNCalibrator.collect_cross_moments`). `E[a_survivor^2]` is
+    `ffn_calibration.FFNCalibrator.collect_cross_moments`). `E[a_survivor^2]` is
     `stats.rms[survivor] ** 2`, already computed by ordinary calibration;
     only the cross term `E[a_dropped * a_survivor]` needs the extra pass.
 

@@ -233,3 +233,137 @@ def test_unsupported_adapter_methods_explain_themselves():
         MinimalAdapter().get_activation_module(0)
     with pytest.raises(NotImplementedError, match="num_layers"):
         MinimalAdapter().num_layers()
+
+
+# --- attention heads: selector-driven and model-wide ------------------------
+
+from conftest import StubBert
+from pruning_transformer import (
+    GradientHeadSelector,
+    HeadCalibrator,
+    OVNormHeadSelector,
+    RedundantHeadSelector,
+    prune_attention_layer,
+    prune_model_attention,
+)
+
+
+def four_head_model():
+    return StubBert(hidden=16, intermediate=16, num_layers=3, heads=4)
+
+
+def test_prune_attention_layer_uses_the_selector_and_still_runs(batches):
+    model = four_head_model()
+    kept = prune_attention_layer(model, 1, OVNormHeadSelector(prune_percent=50))
+    assert kept == 2
+    assert model.encoder.layer[1].attention.self.num_attention_heads == 2
+    assert model.encoder.layer[0].attention.self.num_attention_heads == 4
+    with torch.no_grad():
+        model(**batches[0])
+
+
+def test_uniform_head_allocation_cuts_every_layer_equally(batches):
+    model = four_head_model()
+    kept = prune_model_attention(model, RedundantHeadSelector(prune_percent=25))
+    assert kept == {0: 3, 1: 3, 2: 3}
+    with torch.no_grad():
+        model(**batches[0])
+
+
+def test_global_head_allocation_spends_the_budget_where_heads_are_weak(batches):
+    model = four_head_model()
+    adapter = BertLayerAdapter(model)
+    with torch.no_grad():
+        for h in (0, 1, 2):  # three of layer 2's heads barely write anything
+            adapter.get_attention_heads(2)[3].weight[:, h * 4:(h + 1) * 4] *= 1e-3
+    kept = prune_model_attention(
+        model, OVNormHeadSelector(prune_percent=25), allocation="global", min_keep_ratio=0.25
+    )
+    assert sum(kept.values()) == 9  # 12 heads, 25% cut
+    assert kept[2] == 1 and kept[0] == kept[1] == 4
+    with torch.no_grad():
+        model(**batches[0])
+
+
+def test_global_head_allocation_floors_each_layer(batches):
+    model = four_head_model()
+    adapter = BertLayerAdapter(model)
+    with torch.no_grad():
+        adapter.get_attention_heads(0)[3].weight.mul_(1e-6)  # layer 0 looks worthless
+    kept = prune_model_attention(
+        model, OVNormHeadSelector(prune_percent=50), allocation="global", normalize="none",
+        min_keep_ratio=0.5,
+    )
+    assert kept[0] == 2
+
+
+def test_global_head_allocation_needs_an_importance_selector():
+    with pytest.raises(ValueError, match="HeadImportanceSelector"):
+        prune_model_attention(four_head_model(), RedundantHeadSelector(prune_percent=25),
+                              allocation="global")
+
+
+def test_gradient_driven_head_pruning_end_to_end_with_compensation(batches):
+    """Calibrate (both signals) -> rank globally -> cut with mean
+    compensation -> the pruned model still runs."""
+    model = four_head_model()
+    calibrator = HeadCalibrator(model)
+    loss = lambda outputs, _batch: outputs.square().mean()
+    importance = calibrator.collect_gradient_importance(batches, loss_fn=loss)
+    stats = calibrator.collect_many(batches)
+
+    kept = prune_model_attention(
+        model, GradientHeadSelector(prune_percent=50), allocation="global", normalize="l2",
+        stats_by_layer=stats, gradient_importance_by_layer=importance, compensate_bias=True,
+    )
+    assert sum(kept.values()) == 6
+    with torch.no_grad():
+        model(**batches[0])
+
+
+def test_head_compensation_preserves_the_pruned_layers_mean_output(batches):
+    model = four_head_model()
+    adapter = BertLayerAdapter(model)
+    stats = HeadCalibrator(model).collect(batches, layer_idx=0)
+
+    def mean_projection_output():
+        rows = []
+        output = adapter.get_attention_heads(0)[3]
+        handle = output.register_forward_hook(lambda _m, _i, out: rows.append(out.detach()))
+        with torch.no_grad():
+            for batch in batches:
+                model(**batch)
+        handle.remove()
+        real = [r.reshape(-1, r.shape[-1])[b["attention_mask"].reshape(-1).bool()]
+                for r, b in zip(rows, batches)]
+        return torch.cat(real).mean(dim=0)
+
+    before = mean_projection_output()
+    prune_attention_heads(model, 0, [1, 3], stats=stats, compensate_bias=True)
+    assert torch.allclose(mean_projection_output(), before, atol=1e-5)
+
+
+# --- prune_model_ffn with per-layer selectors -------------------------------
+
+def test_per_layer_selectors_apply_each_layers_own_twins(model, batches):
+    kept = prune_model_ffn(model, {
+        0: TwinRedundancySelector([(0, 1)]),
+        2: TwinRedundancySelector([(3, 4), (5, 6)]),
+    })
+    assert kept == {0: 15, 2: 14}
+    assert BertLayerAdapter(model).get_ffn(1)[0].out_features == 16  # not listed, not touched
+    with torch.no_grad():
+        model(**batches[0])
+
+
+def test_per_layer_selectors_are_uniform_only(model):
+    with pytest.raises(ValueError, match="per-layer mapping"):
+        prune_model_ffn(model, {0: InOutNormSelector(prune_percent=25)}, allocation="global")
+    with pytest.raises(ValueError, match="No selector given"):
+        prune_model_ffn(model, {0: InOutNormSelector(prune_percent=25)}, layer_indices=[0, 1])
+
+
+def test_l2_normalisation_is_accepted_for_ffn_global_ranking(model):
+    kept = prune_model_ffn(model, InOutNormSelector(prune_percent=50), allocation="global",
+                           normalize="l2")
+    assert sum(kept.values()) == 24

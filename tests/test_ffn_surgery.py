@@ -123,7 +123,7 @@ def test_least_squares_merge_scale_reduces_pointwise_error_versus_mean_matching(
     (that's `_bias_compensation`'s job, not the scale's) -- the least-squares
     scale `s* = E[a_dropped*a_survivor]/E[a_survivor^2]`'s actual payoff is a
     smaller *pointwise* (per-token) reconstruction error, which comparing
-    means alone can't distinguish. See `selectors._merge_scale`.
+    means alone can't distinguish. See `ffn_selectors._merge_scale`.
     """
     intermediate, output = make_pair(hidden=6, neurons=8)
     x = torch.randn(500, 6)

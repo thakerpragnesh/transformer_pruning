@@ -1,5 +1,6 @@
 """What a `NeuronSelector` gets to look at when it decides which FFN
-neurons survive.
+neurons survive (`FFNContext`), and what a `head_selectors.HeadSelector`
+gets for attention heads (`HeadContext`).
 
 Selectors used to receive a bare `intermediate.weight` tensor. That was
 enough for the thesis's Max-3 rule but structurally too narrow: a
@@ -16,9 +17,13 @@ tensors, and nothing that consumes it is permitted to mutate them.
 Resizing is `ffn_surgery.FFNSurgeon`'s job alone.
 """
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:  # annotations only: contexts carry stats, they never compute them
+    from ..measurement.ffn_calibration import CalibrationStats
+    from ..measurement.head_calibration import HeadStats
 
 
 @dataclass(frozen=True)
@@ -35,12 +40,12 @@ class FFNContext:
     output_weight: torch.Tensor
     intermediate_bias: Optional[torch.Tensor] = None
     output_bias: Optional[torch.Tensor] = None
-    stats: Optional[Any] = None  # calibration.CalibrationStats; typed loosely to avoid a cycle
+    stats: Optional["CalibrationStats"] = None
     layer_index: Optional[int] = None
-    # {(i, j): E[a_i * a_j]} for i < j, from calibration.FFNCalibrator.collect_cross_moments,
+    # {(i, j): E[a_i * a_j]} for i < j, from ffn_calibration.FFNCalibrator.collect_cross_moments,
     # restricted to whichever pairs a merge-capable selector actually needs (never a full
     # (neurons, neurons) Gram matrix -- see TwinRedundancySelector / _merge_scale in
-    # selectors.py for why only these specific off-diagonal terms are worth computing).
+    # ffn_selectors.py for why only these specific off-diagonal terms are worth computing).
     cross_moments: Optional[dict] = None
 
     @property
@@ -53,7 +58,7 @@ class FFNContext:
             raise ValueError(
                 f"{criterion_name} needs calibration statistics, but this FFNContext has "
                 "stats=None. Collect them first with "
-                "`calibration.FFNCalibrator(model).collect(batches, layer_idx)` and pass the "
+                "`ffn_calibration.FFNCalibrator(model).collect(batches, layer_idx)` and pass the "
                 "result through (e.g. `prune_ffn_layer(..., stats=stats)`)."
             )
         if self.stats.num_neurons != self.num_neurons:
@@ -139,3 +144,96 @@ class Selection:
                 normalised[dropped] = (survivor, float(scale))
             merge_map = normalised
         return cls(keep_indices=keep, merge_map=merge_map or None)
+
+
+@dataclass(frozen=True)
+class HeadContext:
+    """Everything known about one multi-head attention block at
+    head-selection time -- the attention counterpart of `FFNContext`,
+    consumed by `head_selectors.HeadSelector`s.
+
+    A head's contribution to the block output is
+    `W_O[:, h] @ softmax(Q_h K_h^T) V_h`, so like an FFN neuron it is not
+    described by any single weight matrix: the attention pattern comes
+    from `query`/`key`, what gets written comes from `value`/`output` (the
+    "OV circuit"). The context therefore carries all four, plus the two
+    optional data-driven signals -- `stats` (activation moments, from
+    `head_calibration.HeadCalibrator.collect`) and `gradient_importance`
+    (`HeadCalibrator.collect_gradient_importance`) -- that a criterion may
+    need. Like `FFNContext`, it is a read-only view.
+    """
+
+    query_weight: torch.Tensor
+    key_weight: torch.Tensor
+    value_weight: torch.Tensor
+    output_weight: torch.Tensor
+    num_heads: int
+    stats: Optional["HeadStats"] = None
+    gradient_importance: Optional[torch.Tensor] = None  # (num_heads,)
+    layer_index: Optional[int] = None
+
+    def __post_init__(self):
+        rows = self.query_weight.shape[0]
+        if self.num_heads < 1 or rows % self.num_heads:
+            raise ValueError(
+                f"query output size {rows} is not divisible by num_heads {self.num_heads}; "
+                "the adapter is reporting a head layout this layer does not have."
+            )
+        if self.output_weight.shape[1] != rows:
+            raise ValueError(
+                f"Attention block is inconsistent: query/key/value produce {rows} features "
+                f"but the output projection expects {self.output_weight.shape[1]} inputs."
+            )
+
+    @property
+    def head_dim(self) -> int:
+        return self.query_weight.shape[0] // self.num_heads
+
+    def require_stats(self, criterion_name: str):
+        """Return `stats`, or explain which step the caller skipped."""
+        if self.stats is None:
+            raise ValueError(
+                f"{criterion_name} needs head calibration statistics, but this HeadContext has "
+                "stats=None. Collect them first with "
+                "`head_calibration.HeadCalibrator(model).collect(batches, layer_idx)` and pass "
+                "the result through (e.g. `prune_attention_layer(..., stats=stats)`)."
+            )
+        if self.stats.num_heads != self.num_heads:
+            raise ValueError(
+                f"{criterion_name} got head stats for {self.stats.num_heads} heads but this layer "
+                f"has {self.num_heads}. They were most likely collected against a different "
+                "layer, or against this one before an earlier pruning pass."
+            )
+        return self.stats
+
+    def require_gradient_importance(self, criterion_name: str) -> torch.Tensor:
+        """Return `gradient_importance`, or explain which step the caller skipped."""
+        if self.gradient_importance is None:
+            raise ValueError(
+                f"{criterion_name} needs per-head gradient importance, but this HeadContext has "
+                "gradient_importance=None. Collect it first with "
+                "`head_calibration.HeadCalibrator(model).collect_gradient_importance(batches)` "
+                "and pass the layer's entry through (e.g. `prune_attention_layer(..., "
+                "gradient_importance=importance[layer_idx])`)."
+            )
+        if self.gradient_importance.numel() != self.num_heads:
+            raise ValueError(
+                f"{criterion_name} got gradient importance for "
+                f"{self.gradient_importance.numel()} heads but this layer has {self.num_heads}."
+            )
+        return self.gradient_importance
+
+    @classmethod
+    def from_layers(cls, query, key, value, output, num_heads, stats=None,
+                    gradient_importance=None, layer_index=None) -> "HeadContext":
+        """Build a context from a live `(query, key, value, output)` Linear quartet."""
+        return cls(
+            query_weight=query.weight.data,
+            key_weight=key.weight.data,
+            value_weight=value.weight.data,
+            output_weight=output.weight.data,
+            num_heads=num_heads,
+            stats=stats,
+            gradient_importance=gradient_importance,
+            layer_index=layer_index,
+        )

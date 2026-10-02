@@ -11,22 +11,59 @@ a differently-shaped architecture meant editing all three.
 
 Now they depend on adapter interfaces instead. Those interfaces are
 split in two -- `FFNLayerAdapter` (get/set the FFN pair) and
-`AttentionLayerAdapter` (head config, query weight) -- because no
-consumer needs both: `prune_ffn_layer` and `ActivationRecorder` only
-touch the FFN side, `AttentionHeadAnalyzer` only touches the attention
-side. Keeping them separate means a future adapter for a model that only
-needs FFN pruning support implements `FFNLayerAdapter` alone, instead of
-being forced to also stub out attention methods it has no use for
-(Interface Segregation). `BertLayerAdapter` is the only implementation
-so far and satisfies both, since BERT has both blocks at the same
-`encoder.layer[i]` layout.
+`AttentionLayerAdapter` (get/set the attention quartet, head count) --
+because no consumer needs both: `prune_ffn_layer` and `ActivationRecorder`
+only touch the FFN side, `AttentionHeadAnalyzer` only touches the
+attention side. Keeping them separate means a future adapter for a model
+that only needs FFN pruning support implements `FFNLayerAdapter` alone,
+instead of being forced to also stub out attention methods it has no use
+for (Interface Segregation). Both share `LayerStackAdapter`, the one
+place "how many layers, and which ones" is answered.
+
+**Which adapter a consumer gets** is decided in exactly one place,
+`resolve_adapter`. Every consumer used to default to
+`adapter or BertLayerAdapter(model)` -- nine call sites that each named
+the one concrete adapter, so supporting a second model family meant
+passing `adapter=` at every call or editing every default. Now consumers
+ask `resolve_adapter(model, adapter)`, which consults a registry; a new
+family is one `register_adapter(...)` call (Open/Closed) and no consumer
+names a concrete adapter (Dependency Inversion).
 """
 from abc import ABC, abstractmethod
 
 import torch.nn as nn
 
 
-class FFNLayerAdapter(ABC):
+class LayerStackAdapter(ABC):
+    """What every adapter shares: the model is a stack of numbered layers.
+
+    `num_layers()` is optional -- only whole-model entry points need it --
+    so its default explains what to override rather than being abstract.
+    It used to be defined twice, once on each sub-interface, with two
+    different error messages for the same missing method.
+    """
+
+    def num_layers(self) -> int:
+        """How many transformer layers the model has."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement num_layers(), which whole-model "
+            "pruning and calibration need to enumerate layers. Either override it or pass "
+            "an explicit `layer_indices=` list."
+        )
+
+    def resolve_layers(self, layer_indices=None) -> list:
+        """`layer_indices` as a list, or every layer when it is `None`.
+
+        The single home of the "None means all layers" convention that
+        `prune_model_ffn`, `prune_model_attention` and both calibrators
+        share.
+        """
+        if layer_indices is None:
+            return list(range(self.num_layers()))
+        return list(layer_indices)
+
+
+class FFNLayerAdapter(LayerStackAdapter):
     @abstractmethod
     def get_ffn(self, layer_idx: int):
         """Return (intermediate_linear, output_linear) for the layer's FFN block."""
@@ -39,7 +76,7 @@ class FFNLayerAdapter(ABC):
         """Return the module whose output is the FFN's *post-activation*
         hidden tensor -- i.e. exactly what the output projection consumes.
 
-        Deliberately not abstract. Only `calibration.FFNCalibrator` and
+        Deliberately not abstract. Only `ffn_calibration.FFNCalibrator` and
         `activation_recording.ActivationRecorder` need it, so an adapter
         written purely to enable weight-based pruning shouldn't be forced
         to implement it (same Interface Segregation reasoning that split
@@ -60,26 +97,15 @@ class FFNLayerAdapter(ABC):
             "`model.encoder.layer[i].intermediate`)."
         )
 
-    def num_layers(self) -> int:
-        """How many transformer layers the model has.
 
-        Non-abstract for the same reason as `get_activation_module`: only
-        the whole-model `prune_model_ffn` entry point needs it, and an
-        adapter used solely for single-layer work shouldn't have to
-        supply it.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} does not implement num_layers(), which "
-            "`pruning_workflow.prune_model_ffn` needs to enumerate layers. Either override it "
-            "or pass an explicit `layer_indices=` list."
-        )
-
-
-class AttentionLayerAdapter(ABC):
-    @property
-    @abstractmethod
-    def hidden_size(self) -> int:
-        ...
+class AttentionLayerAdapter(LayerStackAdapter):
+    """Three required members: the head count, and getting / setting the
+    `(query, key, value, output)` quartet. Everything a head consumer needs
+    derives from those -- which is why `hidden_size` (read by nothing) is no
+    longer required, and `get_query_weight` is a default built on
+    `get_attention_heads` rather than a fourth thing every adapter must
+    write.
+    """
 
     @abstractmethod
     def num_attention_heads(self, layer_idx: int) -> int:
@@ -93,10 +119,6 @@ class AttentionLayerAdapter(ABC):
         bookkeeping lives on the per-layer self-attention module for the
         same reason; see `BertLayerAdapter.set_attention_heads`.
         """
-
-    @abstractmethod
-    def get_query_weight(self, layer_idx: int):
-        """Return the layer's attention query projection weight."""
 
     @abstractmethod
     def get_attention_heads(self, layer_idx: int):
@@ -114,6 +136,10 @@ class AttentionLayerAdapter(ABC):
         update the per-layer head-count bookkeeping the model's own forward
         pass relies on to reshape Q/K/V into heads.
         """
+
+    def get_query_weight(self, layer_idx: int):
+        """The layer's attention query projection weight."""
+        return self.get_attention_heads(layer_idx)[0].weight.data
 
 
 class TransformerLayerAdapter(FFNLayerAdapter, AttentionLayerAdapter):
@@ -155,9 +181,6 @@ class BertLayerAdapter(TransformerLayerAdapter):
     def num_layers(self) -> int:
         return len(self.model.encoder.layer)
 
-    def get_query_weight(self, layer_idx: int):
-        return self.model.encoder.layer[layer_idx].attention.self.query.weight.data
-
     def get_attention_heads(self, layer_idx: int):
         self_attn = self.model.encoder.layer[layer_idx].attention.self
         output = self.model.encoder.layer[layer_idx].attention.output.dense
@@ -178,3 +201,58 @@ class BertLayerAdapter(TransformerLayerAdapter):
         self_attn.num_attention_heads = num_heads
         self_attn.attention_head_size = query.weight.shape[0] // num_heads
         self_attn.all_head_size = num_heads * self_attn.attention_head_size
+
+
+def _has_bert_layout(model) -> bool:
+    encoder = getattr(model, "encoder", None)
+    return encoder is not None and hasattr(encoder, "layer")
+
+
+# (matches(model) -> bool, factory(model) -> adapter), consulted in order.
+_ADAPTER_REGISTRY = [(_has_bert_layout, BertLayerAdapter)]
+
+
+def register_adapter(matches, factory):
+    """Teach `resolve_adapter` a new model family. Returns a function that
+    undoes the registration.
+
+    `matches(model) -> bool` recognises the family's layout; `factory(model)`
+    builds its adapter. Registrations are consulted newest first, so a
+    caller can also override how an already-supported family is adapted.
+    """
+    entry = (matches, factory)
+    _ADAPTER_REGISTRY.insert(0, entry)
+
+    def unregister():
+        if entry in _ADAPTER_REGISTRY:
+            _ADAPTER_REGISTRY.remove(entry)
+
+    return unregister
+
+
+def resolve_adapter(model, adapter=None):
+    """The adapter a consumer should use for `model`: `adapter` itself if
+    given, otherwise the first registered family that recognises `model` --
+    or, failing that, its HuggingFace `base_model`.
+
+    The `base_model` step is what lets a task model be passed directly.
+    `BertForSequenceClassification` has no `encoder` of its own, but its
+    `base_model` (the `BertModel` inside) does. So the adapter targets the
+    encoder's layers while any batches still run through the whole task
+    model, loss and all. A bare encoder's `base_model` is itself.
+    """
+    if adapter is not None:
+        return adapter
+    candidates = [model]
+    base = getattr(model, "base_model", None)
+    if base is not None and base is not model:
+        candidates.append(base)
+    for candidate in candidates:
+        for matches, factory in _ADAPTER_REGISTRY:
+            if matches(candidate):
+                return factory(candidate)
+    raise TypeError(
+        f"No layer adapter is registered for {type(model).__name__}. Pass `adapter=` "
+        "explicitly, or call `adapters.register_adapter(matches, factory)` once to "
+        "teach every consumer this model family."
+    )

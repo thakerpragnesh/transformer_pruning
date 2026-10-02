@@ -35,3 +35,14 @@ def test_kmeans_is_reproducible_for_a_fixed_seed():
     a = kmeans_assign(x, k=4, seed=7)
     b = kmeans_assign(x, k=4, seed=7)
     assert torch.equal(a, b)
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_kmeans_runs_on_cuda():
+    """The convergence check compares this iteration's assignment with the
+    last one; both must live on the input's device, or `torch.equal` raises
+    on the first iteration."""
+    x = torch.randn(12, 3, device="cuda")
+    assignment = kmeans_assign(x, k=3)
+    assert assignment.device == x.device

@@ -6,7 +6,7 @@ kept in `redundancy.py`. The original `CoActivationScanner` mixed both
 responsibilities in one class; splitting them means the recording
 mechanics don't change if the analysis criterion does, and vice versa.
 
-Compare `calibration.FFNCalibrator`, which streams the same activations
+Compare `ffn_calibration.FFNCalibrator`, which streams the same activations
 but keeps only running moments. This class deliberately retains the full
 per-token pattern, because `JaccardTwinFinder` compares *which tokens*
 two neurons fired on -- information no summary statistic preserves. The
@@ -15,7 +15,8 @@ that keeps every bit that matters at a quarter of float32's footprint.
 """
 import torch
 
-from .model_adapter import BertLayerAdapter
+from .hooks import flatten_tokens, run_hooked
+from ..models.adapters import resolve_adapter
 
 
 class ActivationRecorder:
@@ -27,7 +28,7 @@ class ActivationRecorder:
     def __init__(self, model, tokenizer, adapter=None, batch_size: int = 32, max_length: int = None):
         self.model = model
         self.tokenizer = tokenizer
-        self.adapter = adapter or BertLayerAdapter(model)
+        self.adapter = resolve_adapter(model, adapter)
         self.batch_size = batch_size
         self.max_length = max_length
 
@@ -56,43 +57,20 @@ class ActivationRecorder:
         their evaluation uses.
         """
         module = self.adapter.get_activation_module(layer_idx)
-        device = _model_device(self.model)
         recorded = []
         state = {"mask": None}
 
         def hook(_module, _inputs, output):
-            fired = (output.detach() > threshold).reshape(-1, output.shape[-1])
-            mask = state["mask"]
-            if mask is not None:
-                # Padding positions are an artifact of batching, not data.
-                # Keeping them would make every neuron look co-active with
-                # every other on whatever the model emits for [PAD] --
-                # enough to manufacture twin pairs that don't exist.
-                fired = fired[mask.reshape(-1).to(torch.bool)]
+            # Padding positions are an artifact of batching, not data.
+            # Keeping them would make every neuron look co-active with
+            # every other on whatever the model emits for [PAD] --
+            # enough to manufacture twin pairs that don't exist.
+            fired = flatten_tokens(output, state["mask"]) > threshold
             recorded.append(fired.to(torch.bool).cpu())
 
-        was_training = self.model.training
-        self.model.eval()
-        handle = module.register_forward_hook(hook)
-        try:
-            for batch in batches:
-                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-                batch.pop("labels", None)
-                state["mask"] = batch.get("attention_mask")
-                with torch.no_grad():
-                    self.model(**batch)
-        finally:
-            handle.remove()
-            if was_training:
-                self.model.train()
+        run_hooked(self.model, batches, [(module, hook, False)], state)
 
         if not recorded:
             raise ValueError("Nothing was recorded -- `texts`/`batches` was empty.")
         return torch.cat(recorded, dim=0)
 
-
-def _model_device(model) -> torch.device:
-    device = getattr(model, "device", None)
-    if device is not None:
-        return device
-    return next(model.parameters()).device

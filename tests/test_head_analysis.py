@@ -71,3 +71,13 @@ def test_indivisible_head_layout_is_rejected(model):
 def test_requires_a_model_or_an_adapter():
     with pytest.raises(ValueError, match="requires either"):
         AttentionHeadAnalyzer()
+
+
+def test_ov_similarity_and_norms_from_the_analyzer(model):
+    analyzer = AttentionHeadAnalyzer(model)
+    sim = analyzer.compute_ov_similarity(0)
+    norms = analyzer.compute_ov_norms(0)
+    heads = model.config.num_attention_heads
+    assert sim.shape == (heads, heads) and norms.shape == (heads,)
+    assert np.allclose(np.diag(sim), 1.0, atol=1e-5)
+    assert (norms > 0).all()

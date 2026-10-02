@@ -173,3 +173,25 @@ def test_recorder_is_reusable_across_layers(model, batches):
     # Regression: activations used to accumulate on the instance, so a
     # second call returned the first call's rows concatenated on.
     assert first.shape == second.shape
+
+
+def test_collect_many_matches_collect_per_layer_in_one_pass(model, batches):
+    calibrator = FFNCalibrator(model)
+    calls = {"n": 0}
+    original_forward = model.forward
+
+    def counting_forward(*args, **kwargs):
+        calls["n"] += 1
+        return original_forward(*args, **kwargs)
+
+    model.forward = counting_forward
+    many = calibrator.collect_many(batches)
+    assert calls["n"] == len(batches)  # one pass for all three layers
+    model.forward = original_forward
+
+    assert sorted(many) == [0, 1, 2]
+    for idx in range(3):
+        single = calibrator.collect(batches, layer_idx=idx)
+        assert torch.allclose(many[idx].mean, single.mean)
+        assert torch.allclose(many[idx].rms, single.rms)
+        assert many[idx].tokens == single.tokens

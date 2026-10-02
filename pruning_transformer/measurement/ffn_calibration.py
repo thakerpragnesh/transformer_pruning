@@ -6,7 +6,7 @@ is wired; they cannot see how *often* or how *hard* it actually fires.
 Two neurons with identical incoming weights contribute very differently
 to the layer output if one saturates on real text and the other is
 almost always dead. `CalibrationStats` supplies that missing half, and
-is what `selectors.ActivationAwareSelector` and the bias-compensation
+is what `ffn_selectors.ActivationAwareSelector` and the bias-compensation
 path in `ffn_surgery.FFNSurgeon` consume.
 
 Statistics are accumulated in a streaming fashion -- one small `(neurons,)`
@@ -18,10 +18,15 @@ complementary, not redundant: the recorder keeps per-token detail because
 calibrator throws per-token detail away because nothing downstream of it
 needs more than a mean.
 
+`FFNCalibrator.collect_many` gathers several layers' stats from one pass
+over the corpus -- every forward pass computes every layer anyway, so
+calibrating a 12-layer model with 12 `collect()` calls paid for 11 passes
+it didn't need.
+
 `FFNCalibrator.collect_cross_moments` is the one exception to "per-neuron
 only": a handful of specific *pairwise* moments `E[a_i * a_j]`, computed on
-request for whichever pairs `selectors.TwinRedundancySelector`'s
-least-squares merge scale needs (see `selectors._merge_scale`). It stays a
+request for whichever pairs `ffn_selectors.TwinRedundancySelector`'s
+least-squares merge scale needs (see `ffn_selectors._merge_scale`). It stays a
 separate pass rather than a field on `CalibrationStats` because the full
 `(neurons, neurons)` cross-moment matrix nothing else needs would be
 `O(neurons^2)` memory for every calibration run, not just the ones asking
@@ -31,7 +36,8 @@ from dataclasses import dataclass
 
 import torch
 
-from .model_adapter import BertLayerAdapter
+from .hooks import flatten_tokens, run_hooked
+from ..models.adapters import resolve_adapter
 
 
 @dataclass(frozen=True)
@@ -81,17 +87,17 @@ class CalibrationStats:
 
 class FFNCalibrator:
     """Runs batches through a model and accumulates `CalibrationStats`
-    for one FFN layer.
+    for one FFN layer, or for several in a single pass.
 
     Takes an `FFNLayerAdapter` rather than reaching into a model layout
     directly, for the same reason every other consumer in this package
-    does (see `model_adapter`): a new architecture is a new adapter, not
-    an edit here.
+    does (see `adapters`): a new architecture is a new adapter, not
+    an edit here. Without one, `adapters.resolve_adapter` picks it.
     """
 
     def __init__(self, model, adapter=None):
         self.model = model
-        self.adapter = adapter or BertLayerAdapter(model)
+        self.adapter = resolve_adapter(model, adapter)
 
     def collect(self, batches, layer_idx: int, max_batches: int = None) -> CalibrationStats:
         """Accumulate stats over `batches`.
@@ -103,70 +109,65 @@ class FFNCalibrator:
         the model happens to emit on `[PAD]`, which is an artifact of
         batching rather than a property of the data.
         """
-        module = self.adapter.get_activation_module(layer_idx)
-        device = _model_device(self.model)
+        return self.collect_many(batches, [layer_idx], max_batches=max_batches)[layer_idx]
+
+    def collect_many(self, batches, layer_indices=None, max_batches: int = None) -> dict:
+        """`{layer_idx: CalibrationStats}` for several layers from *one*
+        pass over `batches`.
+
+        Calling `collect()` once per layer costs one full forward pass of
+        the corpus per layer, although every pass computes every layer's
+        activations anyway; hooking all of them at once gets the same
+        numbers for the price of one. `layer_indices=None` means every
+        layer (`adapter.num_layers()`).
+        """
+        layer_indices = self.adapter.resolve_layers(layer_indices)
 
         # float64 CPU accumulators: the per-batch reduction stays in the
         # model's dtype on-device (fast), only the running total is
         # promoted, so a long corpus can't drift the way a float32 (or,
         # worse, float16) running sum would.
-        totals = {"sum": None, "abs_sum": None, "sq_sum": None, "tokens": 0}
+        totals = {idx: {"sum": None, "abs_sum": None, "sq_sum": None, "tokens": 0}
+                  for idx in layer_indices}
         state = {"mask": None}
 
-        def hook(_module, _inputs, output):
-            acts = output.reshape(-1, output.shape[-1])
-            mask = state["mask"]
-            if mask is not None:
-                acts = acts[mask.reshape(-1).to(torch.bool)]
-            if acts.shape[0] == 0:
-                return
-            acts = acts.detach().float()
-            batch_sum = acts.sum(dim=0).double().cpu()
-            batch_abs = acts.abs().sum(dim=0).double().cpu()
-            batch_sq = acts.square().sum(dim=0).double().cpu()
-            if totals["sum"] is None:
-                totals["sum"], totals["abs_sum"], totals["sq_sum"] = batch_sum, batch_abs, batch_sq
-            else:
-                totals["sum"] += batch_sum
-                totals["abs_sum"] += batch_abs
-                totals["sq_sum"] += batch_sq
-            totals["tokens"] += acts.shape[0]
+        def make_hook(acc):
+            def hook(_module, _inputs, output):
+                acts = flatten_tokens(output, state["mask"]).float()
+                if not acts.shape[0]:
+                    return
+                batch = (acts.sum(dim=0), acts.abs().sum(dim=0), acts.square().sum(dim=0))
+                for key, value in zip(("sum", "abs_sum", "sq_sum"), batch):
+                    value = value.double().cpu()
+                    acc[key] = value if acc[key] is None else acc[key] + value
+                acc["tokens"] += acts.shape[0]
+            return hook
 
-        was_training = self.model.training
-        self.model.eval()
-        handle = module.register_forward_hook(hook)
-        try:
-            for i, batch in enumerate(batches):
-                if max_batches is not None and i >= max_batches:
-                    break
-                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-                batch.pop("labels", None)
-                state["mask"] = batch.get("attention_mask")
-                with torch.no_grad():
-                    self.model(**batch)
-        finally:
-            handle.remove()
-            state["mask"] = None
-            if was_training:
-                self.model.train()
+        registrations = [
+            (self.adapter.get_activation_module(idx), make_hook(totals[idx]), False)
+            for idx in layer_indices
+        ]
+        run_hooked(self.model, batches, registrations, state, max_batches=max_batches)
 
-        if totals["tokens"] == 0:
-            raise ValueError("Calibration saw no tokens -- `batches` was empty or fully masked.")
-
-        n = totals["tokens"]
-        return CalibrationStats(
-            mean=(totals["sum"] / n).float(),
-            mean_abs=(totals["abs_sum"] / n).float(),
-            rms=(totals["sq_sum"] / n).sqrt().float(),
-            tokens=n,
-        )
-
+        stats = {}
+        for idx in layer_indices:
+            acc = totals[idx]
+            n = acc["tokens"]
+            if n == 0:
+                raise ValueError("Calibration saw no tokens -- `batches` was empty or fully masked.")
+            stats[idx] = CalibrationStats(
+                mean=(acc["sum"] / n).float(),
+                mean_abs=(acc["abs_sum"] / n).float(),
+                rms=(acc["sq_sum"] / n).sqrt().float(),
+                tokens=n,
+            )
+        return stats
 
     def collect_cross_moments(self, batches, layer_idx: int, pairs, max_batches: int = None) -> dict:
         """`{(i, j): E[a_i * a_j]}` for each `(i, j)` in `pairs`, `i < j`.
 
         `TwinRedundancySelector`'s least-squares merge scale needs this
-        off-diagonal moment (see `selectors._merge_scale`); `collect()`
+        off-diagonal moment (see `ffn_selectors._merge_scale`); `collect()`
         alone only ever gives per-neuron moments (`mean`, `mean_abs`,
         `rms`), which is exactly the diagonal. A full `(neurons, neurons)`
         cross-moment matrix would answer this for free, but at
@@ -187,55 +188,23 @@ class FFNCalibrator:
         left_idx = torch.tensor([p[0] for p in unique_pairs], dtype=torch.long)
         right_idx = torch.tensor([p[1] for p in unique_pairs], dtype=torch.long)
 
-        module = self.adapter.get_activation_module(layer_idx)
-        device = _model_device(self.model)
-
         totals = {"sum": None, "tokens": 0}
         state = {"mask": None}
 
         def hook(_module, _inputs, output):
-            acts = output.reshape(-1, output.shape[-1])
-            mask = state["mask"]
-            if mask is not None:
-                acts = acts[mask.reshape(-1).to(torch.bool)]
-            if acts.shape[0] == 0:
+            acts = flatten_tokens(output, state["mask"]).float()
+            if not acts.shape[0]:
                 return
-            acts = acts.detach().float()
             products = acts[:, left_idx.to(acts.device)] * acts[:, right_idx.to(acts.device)]
             batch_sum = products.sum(dim=0).double().cpu()
-            if totals["sum"] is None:
-                totals["sum"] = batch_sum
-            else:
-                totals["sum"] += batch_sum
+            totals["sum"] = batch_sum if totals["sum"] is None else totals["sum"] + batch_sum
             totals["tokens"] += acts.shape[0]
 
-        was_training = self.model.training
-        self.model.eval()
-        handle = module.register_forward_hook(hook)
-        try:
-            for i, batch in enumerate(batches):
-                if max_batches is not None and i >= max_batches:
-                    break
-                batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
-                batch.pop("labels", None)
-                state["mask"] = batch.get("attention_mask")
-                with torch.no_grad():
-                    self.model(**batch)
-        finally:
-            handle.remove()
-            state["mask"] = None
-            if was_training:
-                self.model.train()
+        module = self.adapter.get_activation_module(layer_idx)
+        run_hooked(self.model, batches, [(module, hook, False)], state, max_batches=max_batches)
 
         if totals["tokens"] == 0:
             raise ValueError("Calibration saw no tokens -- `batches` was empty or fully masked.")
 
         cross = (totals["sum"] / totals["tokens"]).tolist()
         return {pair: value for pair, value in zip(unique_pairs, cross)}
-
-
-def _model_device(model) -> torch.device:
-    device = getattr(model, "device", None)
-    if device is not None:
-        return device
-    return next(model.parameters()).device

@@ -1,11 +1,37 @@
-from .layers import LayerHandle, LayerKind, discover_layers
-from .model_adapter import (
+"""Structured FFN-neuron and attention-head pruning for transformer models.
+
+Import everything from here (`from pruning_transformer import X`): this
+namespace is the public API, and the subpackages are its internal layout.
+
+The package is grouped by role, and each subpackage may only depend on the
+ones listed before it. `tests/test_package_layout.py` enforces that order.
+
+    models/        how to reach into a model: adapters, layer discovery
+    measurement/   running data through it: hooks, calibration, recording
+    analysis/      signals from weights / firings: scores, OV math, twins
+    selection/     criteria: contexts, budgets, FFN and head selectors
+    surgery/       resizing modules: FFN and attention surgeons
+    pipeline/      orchestration: allocation strategies, prune_* functions
+"""
+from .models.layers import LayerHandle, LayerKind, discover_layers
+from .models.adapters import (
+    LayerStackAdapter,
     FFNLayerAdapter,
     AttentionLayerAdapter,
     TransformerLayerAdapter,
     BertLayerAdapter,
+    register_adapter,
+    resolve_adapter,
 )
-from .scoring import (
+from .selection.budget import PruneBudgetMixin, keep_count
+from .pipeline.allocation import (
+    AllocationStrategy,
+    GlobalAllocation,
+    PrunableStructure,
+    SCORE_NORMALIZERS,
+    UniformAllocation,
+)
+from .analysis.scoring import (
     SaliencyScorer,
     TopKMagnitudeScorer,
     Max3SaliencyScorer,
@@ -13,14 +39,15 @@ from .scoring import (
     CSDScorer,
     lowest_scoring,
 )
-from .context import FFNContext, Selection
-from .calibration import CalibrationStats, FFNCalibrator
-from .clustering import kmeans_assign
-from .network_scanner import NetworkSaliencyScanner
-from .head_analysis import AttentionHeadAnalyzer
-from .ffn_surgery import FFNSurgeon
-from .attention_surgery import AttentionSurgeon
-from .selectors import (
+from .selection.context import FFNContext, HeadContext, Selection
+from .measurement.ffn_calibration import CalibrationStats, FFNCalibrator
+from .measurement.head_calibration import HeadStats, HeadCalibrator
+from .analysis.clustering import kmeans_assign
+from .analysis.network_scanner import NetworkSaliencyScanner
+from .analysis.head_analysis import AttentionHeadAnalyzer, ov_norms, ov_similarity
+from .surgery.ffn_surgery import FFNSurgeon
+from .surgery.attention_surgery import AttentionSurgeon
+from .selection.ffn_selectors import (
     NeuronSelector,
     ImportanceSelector,
     SaliencySelector,
@@ -29,18 +56,43 @@ from .selectors import (
     TwinRedundancySelector,
     WeightClusterRedundancySelector,
 )
-from .pruning_workflow import prune_ffn_layer, prune_model_ffn, prune_attention_heads
-from .activation_recording import ActivationRecorder
-from .redundancy import JaccardTwinFinder
+from .selection.head_selectors import (
+    HeadSelector,
+    HeadImportanceSelector,
+    OVNormHeadSelector,
+    ActivationAwareHeadSelector,
+    GradientHeadSelector,
+    RedundantHeadSelector,
+    HEAD_SIMILARITIES,
+)
+from .pipeline.workflow import (
+    prune_ffn_layer,
+    prune_model_ffn,
+    prune_attention_heads,
+    prune_attention_layer,
+    prune_model_attention,
+)
+from .measurement.activation_recording import ActivationRecorder
+from .analysis.redundancy import JaccardTwinFinder
 
 __all__ = [
     "LayerHandle",
     "LayerKind",
     "discover_layers",
+    "LayerStackAdapter",
     "FFNLayerAdapter",
     "AttentionLayerAdapter",
     "TransformerLayerAdapter",
     "BertLayerAdapter",
+    "register_adapter",
+    "resolve_adapter",
+    "PruneBudgetMixin",
+    "keep_count",
+    "AllocationStrategy",
+    "GlobalAllocation",
+    "PrunableStructure",
+    "SCORE_NORMALIZERS",
+    "UniformAllocation",
     "SaliencyScorer",
     "TopKMagnitudeScorer",
     "Max3SaliencyScorer",
@@ -48,12 +100,17 @@ __all__ = [
     "CSDScorer",
     "lowest_scoring",
     "FFNContext",
+    "HeadContext",
     "Selection",
     "CalibrationStats",
     "FFNCalibrator",
+    "HeadStats",
+    "HeadCalibrator",
     "kmeans_assign",
     "NetworkSaliencyScanner",
     "AttentionHeadAnalyzer",
+    "ov_norms",
+    "ov_similarity",
     "FFNSurgeon",
     "AttentionSurgeon",
     "NeuronSelector",
@@ -63,9 +120,18 @@ __all__ = [
     "ActivationAwareSelector",
     "TwinRedundancySelector",
     "WeightClusterRedundancySelector",
+    "HeadSelector",
+    "HeadImportanceSelector",
+    "OVNormHeadSelector",
+    "ActivationAwareHeadSelector",
+    "GradientHeadSelector",
+    "RedundantHeadSelector",
+    "HEAD_SIMILARITIES",
     "prune_ffn_layer",
     "prune_model_ffn",
     "prune_attention_heads",
+    "prune_attention_layer",
+    "prune_model_attention",
     "ActivationRecorder",
     "JaccardTwinFinder",
 ]

@@ -8,9 +8,9 @@ edited when a new one is added (Open/Closed).
 
 Scorers here see only *one* weight tensor, so they can only express
 weight-magnitude criteria. Criteria that also need the FFN's *output*
-projection or calibration activations (see `calibration.py`) are
+projection or calibration activations (see `ffn_calibration.py`) are
 expressed as `NeuronSelector`s instead, which receive an `FFNContext` --
-see `selectors.py`.
+see `ffn_selectors.py`.
 """
 from abc import ABC, abstractmethod
 

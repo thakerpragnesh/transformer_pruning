@@ -120,6 +120,28 @@ def test_twin_chains_resolve_to_a_single_survivor():
     assert selection.merge_map[6][0] == 1
 
 
+def test_twin_chains_resolve_regardless_of_pair_order():
+    """`JaccardTwinFinder` sorts pairs by overlap, not by index, so a chain
+    can arrive as (4, 6) before (1, 4). Resolving each pair only upward from
+    its lower index used to map 6 into 4 and then drop 4, leaving a merge
+    into a removed neuron (a ValueError from `Selection.of`).
+    """
+    ctx = make_ctx(neurons=8)
+    selection = TwinRedundancySelector([(4, 6), (1, 4)], merge=True).select(ctx)
+    assert selection.keep_indices == [0, 1, 2, 3, 5, 7]
+    assert selection.merge_map[4][0] == 1
+    assert selection.merge_map[6][0] == 1
+
+
+def test_twin_pairs_sharing_a_neuron_collapse_to_one_survivor():
+    """(2, 5) and (1, 5) put 1, 2 and 5 in one twin group: only the lowest
+    index survives. Overwriting 5's survivor used to leave 2 in the model."""
+    ctx = make_ctx(neurons=6)
+    selection = TwinRedundancySelector([(2, 5), (1, 5)], merge=True).select(ctx)
+    assert selection.keep_indices == [0, 1, 3, 4]
+    assert {d: s for d, (s, _) in selection.merge_map.items()} == {2: 1, 5: 1}
+
+
 def test_twin_merge_scale_uses_calibration_when_available():
     stats = CalibrationStats(
         mean=torch.tensor([1.0, 2.0, 1.0, 1.0]), mean_abs=torch.ones(4),
@@ -246,6 +268,25 @@ def test_weight_cluster_selector_drops_a_direction_duplicate():
     assert len({0, 1} & set(selection.keep_indices)) == 1
 
 
+def test_weight_cluster_selector_keeps_the_requested_count_with_duplicate_directions():
+    """Eight neurons pointing in only two directions, asked to keep four.
+    K-Means can only form two non-empty clusters here, and keeping one
+    neuron per non-empty cluster used to keep two -- twice the cut asked for.
+    """
+    intermediate = nn.Linear(6, 8)
+    output = nn.Linear(8, 3)
+    with torch.no_grad():
+        intermediate.weight[:4] = torch.ones(4, 6) * torch.arange(1, 5).unsqueeze(1)
+        intermediate.weight[4:] = -torch.ones(4, 6) * torch.arange(1, 5).unsqueeze(1)
+    ctx = FFNContext.from_layers(intermediate, output)
+
+    selection = WeightClusterRedundancySelector(prune_percent=50, merge=True).select(ctx)
+    assert len(selection.keep_indices) == 4
+    # Each direction keeps its loudest neuron; the extra slots go to the next-loudest.
+    assert {3, 7} <= set(selection.keep_indices)
+    assert set(selection.merge_map).isdisjoint(selection.keep_indices)
+
+
 def test_weight_cluster_selector_keeps_the_higher_l1_norm_representative():
     intermediate = nn.Linear(4, 6)
     output = nn.Linear(6, 4)
@@ -285,3 +326,10 @@ def test_twin_merge_scale_guards_a_near_zero_denominator():
     ctx = make_ctx(neurons=4, stats=stats)
     selection = TwinRedundancySelector([(0, 1)], merge=True).select(ctx)
     assert selection.merge_map[1] == (0, 1.0)
+
+
+def test_merge_pairs_name_the_folds_not_the_twin_list():
+    """A chain (1, 4), (4, 6) folds 6 into 1 -- the pair cross moments must
+    be collected for, though no twin pair says so."""
+    selector = TwinRedundancySelector([(4, 6), (1, 4)], merge=True)
+    assert selector.merge_pairs == [(4, 1), (6, 1)]

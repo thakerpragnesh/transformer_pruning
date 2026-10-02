@@ -9,7 +9,8 @@ Diagnostic only; stage 10 turns the same signal into actual surgery.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# `_mrpc.py` sits one level up, in experiments/, shared by both groups.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from _mrpc import set_seeds
 

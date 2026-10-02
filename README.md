@@ -22,24 +22,35 @@ scanning, surgery, or orchestration code.
 
 ### Interfaces
 
-- **`SaliencyScorer`** (`scoring.py`) — scores a weight tensor's output
+- **`SaliencyScorer`** (`analysis/scoring.py`) — scores a weight tensor's output
   units. `TopKMagnitudeScorer(k)` generalizes the thesis's Max-3 rule
   (`Max3SaliencyScorer` is `k=3`) across conv and linear weights in one
   code path; `LpNormScorer` is the standard magnitude baseline, kept here
   so an experiment can report both from the same scanner.
-- **`NeuronSelector`** (`selectors.py`) — decides which FFN neurons
+- **`NeuronSelector`** (`selection/ffn_selectors.py`) — decides which FFN neurons
   survive, given an `FFNContext`. Returns a `Selection`.
-- **`FFNLayerAdapter` / `AttentionLayerAdapter`** (`model_adapter.py`) —
+- **`HeadSelector`** (`selection/head_selectors.py`) — decides which attention heads
+  survive, given a `HeadContext`. Returns the head indices to keep.
+- **`FFNLayerAdapter` / `AttentionLayerAdapter`** (`models/adapters.py`) —
   reach into a model to get/set a layer's FFN `(intermediate, output)`
-  pair, or to read its attention query weight and head config. Split in
+  pair, or its attention `(query, key, value, output)` quartet and head
+  count. Split in
   two because no consumer needs both (Interface Segregation).
   `BertLayerAdapter` implements both — it also covers RoBERTa, which
   shares BERT's layout — but a differently-shaped architecture is a new
-  adapter class, not an edit to any consumer.
+  adapter class, not an edit to any consumer. No consumer names a concrete
+  adapter: all of them call `resolve_adapter(model)`. That uses a registry
+  (`register_adapter` teaches every consumer a new family at once) and
+  unwraps HuggingFace task models via `base_model`, so a
+  `BertForSequenceClassification` can be passed anywhere an encoder can.
+- **`AllocationStrategy`** (`pipeline/allocation.py`) — how a model-wide budget is
+  spent: `UniformAllocation` or `GlobalAllocation`, or your own, passed as
+  `allocation=`. Strategies see FFN neurons and attention heads through one
+  `PrunableStructure` interface, so one strategy serves both.
 
 ### What a selector gets to see
 
-A selector receives an **`FFNContext`** (`context.py`), not a bare weight
+A selector receives an **`FFNContext`** (`selection/context.py`), not a bare weight
 tensor. That matters because a neuron's actual contribution to the layer
 output is
 
@@ -91,54 +102,126 @@ distribution — common in a fine-tuned model, where the pretrained FFN
 carries capacity the downstream task never exercises. That is what
 calibration supplies.
 
+### Attention heads
+
+A head's contribution to the block output is `W_O[:, h] @ softmax(Q_h K_hᵀ) V_h`:
+`query`/`key` decide where it looks, `value`/`output` (its *OV circuit*)
+decide what it writes. A `HeadSelector` receives a **`HeadContext`** with
+all four weights plus, optionally, calibrated statistics and gradient
+importance.
+
+| Selector | Sees | Idea |
+|---|---|---|
+| `RedundantHeadSelector` | OV circuit (or `W_Q`) | Greedily drop the weaker head of the most similar remaining pair. `similarity="query"` is the thesis-era query-cosine signal, kept as the baseline |
+| `OVNormHeadSelector` | `W_V`, `W_O` | `‖W_O[:, h] W_V[h]‖_F` — how much the head *can* write |
+| `ActivationAwareHeadSelector` | activations | `sqrt(E‖W_O[:, h] ctx_h‖²)` — how much it *does* write (`statistic="std"`: what's left after mean-ablation) |
+| `GradientHeadSelector` | task loss | Michel et al. (2019), `E\|∂L/∂ξ_h\|` for a gate `ξ_h` on the head — how much the task cares |
+
+`HeadCalibrator` (`measurement/head_calibration.py`) measures both data-driven signals
+by hooking the attention output projection, whose input is exactly the
+heads' concatenated context vectors. Because of that hook it needs no model
+forward-signature support: transformers 5.x dropped `head_mask`, which the
+paper's reference code used to place the gate.
+
 ### Making a cut cost less
 
-Two corrections apply to any criterion, both in `FFNSurgeon`:
+Two corrections apply to any FFN criterion, both in `FFNSurgeon`, and
+the first applies to heads too (`AttentionSurgeon`):
 
 - **Bias compensation.** Deleting neuron `i` removes `W_out[:, i] * a_i`
   from the layer output. Its expectation `W_out[:, i] * E[a_i]` is a
   constant, and a constant is exactly what a bias represents exactly — so
   folding it into `output.bias` preserves the layer's mean output for
   free, leaving only the zero-mean residual as real damage. Costs one
-  calibration pass.
+  calibration pass. For a head, the same argument turns deleting it
+  (zero-ablation) into replacing it with its mean output (mean-ablation):
+  `W_O[:, h] @ E[ctx_h]` goes into the output bias.
 - **Merging.** Fold a removed neuron's output column into a surviving one.
   When the two are genuinely interchangeable this is output-preserving on
   *every* input, not merely on average.
 
-### Everything else
+### Package layout
 
-- **`layers.py`** — `discover_layers`: finds `Conv2d`/`Linear` modules by
+The package is grouped by role. Each subpackage may only import from the
+ones above it, an order `tests/test_package_layout.py` enforces:
+
+```
+pruning_transformer/
+├── models/       adapters (+ resolve_adapter), layer discovery
+├── measurement/  hooks, FFN/head calibration, activation recording
+├── analysis/     saliency scorers, network scanner, head/OV analysis, twins, k-means
+├── selection/    contexts, budget rule, FFN and head selectors
+├── surgery/      rebuild_linear, FFN and attention surgeons
+└── pipeline/     allocation strategies, prune_* entry points
+```
+
+The subpackages are internal layout: everything public is exported from
+`pruning_transformer` itself, so always import from there. The interfaces
+and criteria above live in `analysis/scoring.py`, `selection/ffn_selectors.py`,
+`selection/head_selectors.py`, `selection/context.py`, `models/adapters.py` and
+`pipeline/allocation.py`. The rest, by subpackage:
+
+**`models/`** — how to reach into a model
+
+- **`models/layers.py`** — `discover_layers`: finds `Conv2d`/`Linear` modules by
   type and name, nothing else.
-- **`network_scanner.py`** — `NetworkSaliencyScanner(layers, scorer)`:
-  per-layer saliency stats and weakest units for *any* layer set + scorer
-  combination.
-- **`ffn_surgery.py`** — `FFNSurgeon`: the only code that knows how to
-  physically resize an FFN's `(intermediate, output)` Linear pair.
-  Written once; every selector shares it.
-- **`pruning_workflow.py`** — `prune_ffn_layer` (one layer) and
-  `prune_model_ffn` (the whole stack). The one place selection and
-  surgery meet.
-- **`head_analysis.py`** — `AttentionHeadAnalyzer`: cosine similarity and
-  Lp-distance between attention heads, with a `normalize` flag.
-- **`attention_surgery.py`** — `AttentionSurgeon`: the compression half of
-  head redundancy — physically removes head rows from `query`/`key`/`value`
-  and the matching columns from `attention.output.dense`. No merge or bias
-  compensation here: a head's contribution is a function of the input, not
-  a per-neuron constant. `pruning_workflow.prune_attention_heads` wires it
-  to a live model.
-- **`calibration.py`** — `FFNCalibrator`: streams batches and accumulates
+
+**`measurement/`** — running real data through it
+
+- **`measurement/hooks.py`** — the hook-and-forward loop every measurement shares
+  (both calibrators and the recorder differ only in their hooks).
+- **`measurement/ffn_calibration.py`** — `FFNCalibrator`: streams batches and accumulates
   per-neuron activation moments without materialising the full
-  `(tokens, neurons)` tensor.
-- **`activation_recording.py`** — `ActivationRecorder`: records which
+  `(tokens, neurons)` tensor; `collect_many` does every layer in one pass.
+- **`measurement/head_calibration.py`** — `HeadCalibrator`: per-head contribution
+  moments (`HeadStats`) and gradient importance, streamed batch by batch.
+- **`measurement/activation_recording.py`** — `ActivationRecorder`: records which
   neurons fire on real inputs, keeping full per-token detail (which
   `JaccardTwinFinder` needs and no summary statistic preserves).
-- **`redundancy.py`** — `JaccardTwinFinder`: flags neuron pairs with
+
+**`analysis/`** — signals from weights or firings
+
+- **`analysis/network_scanner.py`** — `NetworkSaliencyScanner(layers, scorer)`:
+  per-layer saliency stats and weakest units for *any* layer set + scorer
+  combination.
+- **`analysis/head_analysis.py`** — `AttentionHeadAnalyzer`: cosine similarity and
+  Lp-distance between heads' query weights (with a `normalize` flag), and
+  OV-circuit norms/similarity (`ov_norms`, `ov_similarity`), computed through
+  `(head_dim, head_dim)` Gram blocks, not `(hidden, hidden)` products.
+- **`analysis/redundancy.py`** — `JaccardTwinFinder`: flags neuron pairs with
   near-identical firing patterns (true Jaccard/IoU) as redundant "twins",
   and reports neurons that never fire at all.
-- **`clustering.py`** — `kmeans_assign`: from-scratch Lloyd's-algorithm
+- **`analysis/clustering.py`** — `kmeans_assign`: from-scratch Lloyd's-algorithm
   k-means, no external ML dependency. Used by
   `WeightClusterRedundancySelector`; a standalone utility because
   clustering is a strategy in its own right, not selector bookkeeping.
+
+**`selection/`** — criteria
+
+- **`selection/budget.py`** — the `prune_percent` rounding rule, mixed into every
+  budgeted selector (`PruneBudgetMixin`).
+- **`selection/head_selectors.py`** — the head criteria above.
+
+**`surgery/`** — resizing modules
+
+- **`surgery/linear_ops.py`** — `rebuild_linear`, the one way surgery builds a
+  resized `nn.Linear` (preserving dtype, device and `requires_grad`).
+- **`surgery/ffn_surgery.py`** — `FFNSurgeon`: the only code that knows how to
+  physically resize an FFN's `(intermediate, output)` Linear pair.
+  Written once; every selector shares it.
+- **`surgery/attention_surgery.py`** — `AttentionSurgeon`: physically removes head
+  rows from `query`/`key`/`value` and the matching columns from
+  `attention.output.dense`, with optional bias compensation. No merge: two
+  heads that attend alike can still read and write different subspaces.
+
+**`pipeline/`** — orchestration
+
+- **`pipeline/allocation.py`** — the allocation strategies, the `PrunableStructure`
+  interface they work through, and the `SCORE_NORMALIZERS` registry.
+- **`pipeline/workflow.py`** — `prune_ffn_layer` / `prune_attention_layer`
+  (one layer), `prune_model_ffn` / `prune_model_attention` (the whole
+  stack, uniform or global allocation), and `prune_attention_heads` (cut
+  explicit head indices). The one place selection and surgery meet.
 
 ## Usage
 
@@ -171,9 +254,42 @@ layers that turn out to be redundant give up more. FFN redundancy is
 generally not spread evenly across depth, so uniform over-cuts the layers
 carrying the model and under-cuts the ones that aren't.
 
+Attention heads follow the same pattern:
+
+```python
+from pruning_transformer import GradientHeadSelector, HeadCalibrator, prune_model_attention
+
+# The task model is passed as-is: the calibrator hooks its encoder, and
+# gradient importance gets the classifier's loss (batches with `labels`).
+calibrator = HeadCalibrator(model)
+head_stats = calibrator.collect_many(batches)
+importance = calibrator.collect_gradient_importance(labelled_batches)
+
+kept = prune_model_attention(
+    model, GradientHeadSelector(prune_percent=25), allocation="global",
+    normalize="l2", stats_by_layer=head_stats,
+    gradient_importance_by_layer=importance, compensate_bias=True,
+)  # -> {0: 7, 1: 6, 2: 5, 3: 6}
+```
+
+When cutting both, cut heads first, then calibrate the FFN on the
+head-pruned model before cutting it: the head cut changes every
+downstream FFN's input distribution.
+
 ## Experiments
 
-`experiments/` — runnable scripts, one per exploration stage:
+`experiments/` holds one runnable script per exploration stage, grouped by
+what a script costs to run. The stage numbers keep the narrative order
+across both folders.
+
+```
+experiments/
+├── _mrpc.py        shared MRPC harness (both groups use it)
+├── diagnostics/    no training: seconds to minutes
+└── accuracy/       fine-tune → prune → heal on MRPC: needs a GPU
+```
+
+**`experiments/diagnostics/`**: quick looks, no training.
 
 | Script | What it validates |
 |---|---|
@@ -181,20 +297,28 @@ carrying the model and under-cuts the ones that aren't.
 | `02_vgg_network_scan.py` | Max-3 stats across all of VGG16 |
 | `03_bert_universal_scan.py` | Max-3 crossed over onto BERT-tiny FFN |
 | `04_bert_pruning_surgery_demo.py` | Neuron surgery doesn't break a forward pass |
-| `05_bert_mrpc_full_experiment.py` | Real accuracy: four criteria compared, baseline → prune → heal, on MRPC |
-| `06_attention_head_similarity.py` | Cosine similarity between attention heads |
+| `06_attention_head_similarity.py` | Query-weight vs. OV-circuit cosine similarity between attention heads |
 | `07_attention_head_distance.py` | Manhattan vs. Euclidean head distance |
 | `08_attention_scaled_distribution.py` | Distance on unit-normalized heads |
 | `09_coactivation_twin_scan.py` | Behavior-based twin-neuron and dead-neuron detection |
-| `10_twin_neuron_pruning_experiment.py` | Real accuracy: twins dropped vs. twins merged, on MRPC |
-| `11_global_multilayer_pruning.py` | Uniform vs. global budget allocation at equal compression |
 
-Stages 05, 10 and 11 train. Each compares its variants from one shared
-trained baseline at one fixed seed (`experiments/_mrpc.py`), so the only
-difference between rows is the criterion under test. The interesting
-column is *pre-heal* accuracy — healing can paper over a bad cut given
-enough epochs, so the pre-heal number is what measures how much the
-criterion actually knew.
+**`experiments/accuracy/`**: the scripts that produce results.
+
+| Script | What it validates |
+|---|---|
+| `05_bert_mrpc_full_experiment.py` | Real accuracy: five FFN criteria compared, baseline → prune → heal, on MRPC |
+| `10_twin_neuron_pruning_experiment.py` | Real accuracy: twins dropped vs. merged (mean-matching vs. least-squares scale), on MRPC |
+| `11_global_multilayer_pruning.py` | Uniform vs. global budget allocation at equal compression |
+| `12_attention_head_pruning_experiment.py` | Real accuracy: seven head-pruning variants (redundancy, OV norm, activation-aware, gradient), on BERT-small |
+| `13_joint_ffn_attention_compression.py` | FFN-only vs. heads-only vs. both, with parameter savings |
+
+Every `accuracy/` script compares its variants from one shared trained
+baseline at one fixed seed (`experiments/_mrpc.py`), so the only difference
+between rows is the criterion under test. The interesting column is
+*pre-heal* accuracy. Healing can paper over a bad cut given enough epochs,
+so the pre-heal number is what measures how much the criterion actually
+knew. `tests/test_experiments_layout.py` keeps the split honest: a script
+that trains must live in `accuracy/`, and nothing else may.
 
 ## Running
 
@@ -204,8 +328,11 @@ to run on Colab/Kaggle:
 
 ```
 pip install -r requirements.txt
-python experiments/05_bert_mrpc_full_experiment.py
+python experiments/accuracy/05_bert_mrpc_full_experiment.py
 ```
+
+Scripts can be run from any working directory. Outputs (`./results`,
+`./data`, the `.png` plots) land in the directory you run from.
 
 ### Tests
 
@@ -218,12 +345,20 @@ pip install -e ".[dev]"
 pytest
 ```
 
+`tests/test_package_layout.py` also checks the package's folder structure
+itself: no module outside the six subpackages, unique module names, and no
+import from a higher layer.
+
 ## Status
 
 The pruning mechanics are covered by the test suite — surgery preserves
 dtype and `requires_grad`, merging identical neurons is exactly
-output-preserving, bias compensation exactly preserves the mean output,
-budgets are honoured, and dead-neuron detection works.
+output-preserving, bias compensation exactly preserves the mean output
+(for FFN neurons and for heads), budgets are honoured, dead-neuron
+detection works, and head gradient importance matches finite differences.
+The head stack has also been checked against a real transformers 5.17
+`BertForSequenceClassification` (random init, eager and SDPA attention):
+pruned logits equal zero-gating the same heads to within 1e-8.
 
 The **research numbers are not**. No experiment has been run end-to-end
 in this repo's layout yet; before citing any accuracy figure, actually
